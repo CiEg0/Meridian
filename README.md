@@ -20,21 +20,18 @@ Meridian 把多站点反代、UA 身份、流量管控和故障诊断整合进�
 
 ## 界面预览
 
-### 仪表盘
+<table>
+  <tr>
+    <td align="center"><a href="docs/dashboard.webp"><img src="docs/dashboard.webp" width="380" alt="Meridian 仪表盘"></a><br><strong>仪表盘</strong></td>
+    <td align="center"><a href="docs/sites.webp"><img src="docs/sites.webp" width="380" alt="Meridian 站点管理"></a><br><strong>站点管理</strong></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="docs/traffic.webp"><img src="docs/traffic.webp" width="380" alt="Meridian 流量统计"></a><br><strong>流量统计</strong></td>
+    <td align="center"><a href="docs/diagnostics.webp"><img src="docs/diagnostics.webp" width="380" alt="Meridian 故障诊断"></a><br><strong>故障诊断</strong></td>
+  </tr>
+</table>
 
-![Meridian 仪表盘](docs/dashboard.webp)
-
-### 站点管理
-
-![Meridian 站点管理](docs/sites.webp)
-
-### 流量统计
-
-![Meridian 流量统计](docs/traffic.webp)
-
-### 故障诊断
-
-![Meridian 故障诊断](docs/diagnostics.webp)
+<p align="center"><sub>点击图片查看原图</sub></p>
 
 ## 功能概览
 
