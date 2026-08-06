@@ -1550,6 +1550,47 @@ func TestDynamicRedirectFailsClosedForDisabledStructuredSource(t *testing.T) {
 	_ = mediaBody.Close()
 }
 
+func TestTrustedCapabilityDoesNotGainManualRedirectSemantics(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileSafe)
+	origin := mustStructuredURL(t, "https://origin.example.com/master.m3u8")
+	privateTarget, parseErr := url.Parse("http://127.0.0.1:18080/private.m3u8")
+	if parseErr != nil {
+		t.Fatalf("parse private manual target: %v", parseErr)
+	}
+	originAuthority := redirectHostKey(origin)
+	privateAuthority := redirectHostKey(privateTarget)
+	issuer.primaryAuthority = originAuthority
+	issuer.configuredAuthorities = map[string]bool{originAuthority: true, privateAuthority: true}
+	calls := 0
+	issuer.configuredTransport = structuredRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if redirectHostKey(request.URL) == originAuthority {
+			return &http.Response{
+				StatusCode: http.StatusSeeOther,
+				Header:     http.Header{"Location": []string{privateTarget.String()}},
+				Body:       io.NopCloser(strings.NewReader("redirect")),
+				Request:    request,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/vnd.apple.mpegurl"}},
+			Body:       io.NopCloser(strings.NewReader("#EXTM3U\n#EXT-X-ENDLIST\n")),
+			Request:    request,
+		}, nil
+	})
+	session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: origin, source: dynamicDiscoverySourceHLS}
+	route, rewriteErr := session.rewriteManifest("child.m3u8")
+	if rewriteErr != nil || !session.commit() {
+		t.Fatalf("mint trusted capability route=%q err=%v", route, rewriteErr)
+	}
+	recorder := httptest.NewRecorder()
+	issuer.serve(recorder, httptest.NewRequest(http.MethodGet, "https://site.example"+route, nil))
+	if recorder.Code != http.StatusBadGateway || calls != 1 || strings.Contains(recorder.Body.String(), privateTarget.String()) {
+		t.Fatalf("trusted capability redirect status=%d calls=%d body=%q, want sanitized 502/1", recorder.Code, calls, recorder.Body.String())
+	}
+}
+
 func TestManifestCapabilityPreservesSanitizedUpstreamError(t *testing.T) {
 	issuer := newStructuredDiscoveryTestIssuer(t)
 	base := mustStructuredURL(t, "https://origin.example.com/master.m3u8")

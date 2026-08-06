@@ -1396,6 +1396,20 @@ const (
 	dynamicObservationSourceHLS          = dynamicDiscoverySourceHLS
 	dynamicObservationSourceDASH         = dynamicDiscoverySourceDASH
 
+	dynamicObservationTargetSameAuthority = "same_authority"
+	dynamicObservationTargetConfigured    = "configured"
+	dynamicObservationTargetDiscovered    = "discovered"
+
+	dynamicObservationStageResponse   = "response"
+	dynamicObservationStageLocation   = "location"
+	dynamicObservationStagePolicy     = "policy"
+	dynamicObservationStageResolve    = "resolve"
+	dynamicObservationStageConnect    = "connect"
+	dynamicObservationStageCapacity   = "capacity"
+	dynamicObservationStageParse      = "parse"
+	dynamicObservationStageCapability = "capability"
+	dynamicObservationStageRuntime    = "runtime"
+
 	dynamicObservationDecisionAllowed = "allowed"
 	dynamicObservationDecisionDenied  = "denied"
 
@@ -1420,8 +1434,10 @@ const (
 
 	dynamicObservationQueueCapacity                  = 2048
 	dynamicObservationBatchSize                      = 128
+	dynamicObservationRetentionDays                  = 30
+	dynamicObservationPerSiteRowLimit                = 500
 	dynamicObservationGlobalRowLimit                 = 10000
-	dynamicObservationRetention                      = 30 * 24 * time.Hour
+	dynamicObservationRetention                      = dynamicObservationRetentionDays * 24 * time.Hour
 	dynamicObservationMaintenanceInterval            = time.Hour
 	dynamicObservationReasonCandidateAllowed         = "candidate_allowed"
 	dynamicObservationReasonParseFailure             = "parse_failure"
@@ -1445,8 +1461,10 @@ type dynamicObservationEvent struct {
 	SiteID             int64
 	CanonicalAuthority string
 	Source             string
+	TargetKind         string
 	Decision           string
 	ReasonCode         string
+	RedirectStatus     int
 }
 
 // DynamicObservation is deliberately identical to the frozen database/API
@@ -1455,16 +1473,88 @@ type DynamicObservation struct {
 	SiteID             int64  `json:"site_id"`
 	CanonicalAuthority string `json:"canonical_authority"`
 	Source             string `json:"source"`
+	TargetKind         string `json:"target_kind"`
+	Stage              string `json:"stage"`
 	Decision           string `json:"decision"`
 	ReasonCode         string `json:"reason_code"`
+	RedirectStatus     int    `json:"redirect_status"`
 	FirstSeenMS        int64  `json:"first_seen_ms"`
 	LastSeenMS         int64  `json:"last_seen_ms"`
 	Count              int64  `json:"count"`
 }
 
 type DynamicObservationsResponse struct {
-	Observations        []DynamicObservation `json:"observations"`
-	DroppedObservations uint64               `json:"dropped_observations"`
+	Observations              []DynamicObservation `json:"observations"`
+	DroppedObservationsGlobal uint64               `json:"dropped_observations_global"`
+	RetentionDays             int                  `json:"retention_days"`
+	PerSiteRowLimit           int                  `json:"per_site_row_limit"`
+	GlobalRowLimit            int                  `json:"global_row_limit"`
+}
+
+func dynamicObservationStageForReason(reasonCode string) (string, bool) {
+	switch reasonCode {
+	case dynamicObservationReasonRedirectAllowed,
+		dynamicObservationReasonUnsupportedStatus,
+		dynamicObservationReasonResponseFailure:
+		return dynamicObservationStageResponse, true
+	case dynamicObservationReasonInvalidLocation,
+		dynamicObservationReasonRedirectLoop,
+		dynamicObservationReasonHopLimit:
+		return dynamicObservationStageLocation, true
+	case dynamicObservationReasonCandidateAllowed,
+		dynamicObservationReasonSchemeDenied,
+		dynamicObservationReasonPortDenied,
+		dynamicObservationReasonDomainDenied,
+		dynamicObservationReasonHTTPSDowngradeDenied,
+		dynamicObservationReasonSelfTarget,
+		dynamicObservationReasonPlaybackInfoDenied,
+		dynamicObservationReasonHLSFeatureDenied,
+		dynamicObservationReasonDASHFeatureDenied:
+		return dynamicObservationStagePolicy, true
+	case dynamicObservationReasonDNSFailure,
+		dynamicObservationReasonAddressDenied:
+		return dynamicObservationStageResolve, true
+	case dynamicObservationReasonDialFailure,
+		dynamicObservationReasonTLSFailure:
+		return dynamicObservationStageConnect, true
+	case dynamicObservationReasonCapacityLimit,
+		dynamicObservationReasonRateLimit:
+		return dynamicObservationStageCapacity, true
+	case dynamicObservationReasonParseFailure,
+		dynamicObservationReasonRequestUnclassified,
+		dynamicObservationReasonStructuredBodyLimit,
+		dynamicObservationReasonRedirectBodyReplayDenied:
+		return dynamicObservationStageParse, true
+	case dynamicObservationReasonCapabilityInvalid,
+		dynamicObservationReasonCapabilityExpired:
+		return dynamicObservationStageCapability, true
+	case dynamicObservationReasonRuntimeUnavailable:
+		return dynamicObservationStageRuntime, true
+	default:
+		return "", false
+	}
+}
+
+func validDynamicObservationTargetKind(targetKind string) bool {
+	switch targetKind {
+	case dynamicObservationTargetSameAuthority,
+		dynamicObservationTargetConfigured,
+		dynamicObservationTargetDiscovered:
+		return true
+	default:
+		return false
+	}
+}
+
+func validDynamicObservationRedirectStatus(status int) bool {
+	return status == 0 || status >= 300 && status <= 399
+}
+
+func validDynamicObservationRouteDimensions(source, targetKind string, redirectStatus int) bool {
+	if !validDynamicObservationTargetKind(targetKind) || !validDynamicObservationRedirectStatus(redirectStatus) {
+		return false
+	}
+	return source == dynamicObservationSourceRedirect || redirectStatus == 0
 }
 
 func validDynamicObservationEnums(source, decision, reasonCode string) bool {
@@ -1541,6 +1631,7 @@ func isCanonicalDynamicObservationAuthority(value string) bool {
 
 type queuedDynamicObservation struct {
 	event        dynamicObservationEvent
+	stage        string
 	observedAtMS int64
 }
 
@@ -1666,7 +1757,8 @@ func (d *DB) EnqueueDynamicObservation(event dynamicObservationEvent) {
 	if d == nil {
 		return
 	}
-	if event.SiteID <= 0 || !validDynamicObservationEnums(event.Source, event.Decision, event.ReasonCode) || !isCanonicalDynamicObservationAuthority(event.CanonicalAuthority) {
+	stage, stageOK := dynamicObservationStageForReason(event.ReasonCode)
+	if event.SiteID <= 0 || !validDynamicObservationEnums(event.Source, event.Decision, event.ReasonCode) || !stageOK || !validDynamicObservationRouteDimensions(event.Source, event.TargetKind, event.RedirectStatus) || !isCanonicalDynamicObservationAuthority(event.CanonicalAuthority) {
 		d.droppedDynamicObservations.Add(1)
 		return
 	}
@@ -1674,6 +1766,7 @@ func (d *DB) EnqueueDynamicObservation(event dynamicObservationEvent) {
 		kind: dynamicObservationCommandWrite,
 		event: queuedDynamicObservation{
 			event:        event,
+			stage:        stage,
 			observedAtMS: time.Now().UnixMilli(),
 		},
 	}
@@ -1737,10 +1830,10 @@ func (d *DB) ListDynamicObservations(siteID int64) ([]DynamicObservation, error)
 		return nil, err
 	}
 	rows, err := d.db.Query(`
-		SELECT site_id, canonical_authority, source, decision, reason_code, first_seen_ms, last_seen_ms, count
+		SELECT site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status, first_seen_ms, last_seen_ms, count
 		FROM dynamic_observations
 		WHERE site_id=?
-		ORDER BY last_seen_ms DESC, first_seen_ms DESC, canonical_authority, source, decision, reason_code`, siteID)
+		ORDER BY last_seen_ms DESC, first_seen_ms DESC, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status`, siteID)
 	if err != nil {
 		return nil, err
 	}
@@ -1752,15 +1845,19 @@ func (d *DB) ListDynamicObservations(siteID int64) ([]DynamicObservation, error)
 			&observation.SiteID,
 			&observation.CanonicalAuthority,
 			&observation.Source,
+			&observation.TargetKind,
+			&observation.Stage,
 			&observation.Decision,
 			&observation.ReasonCode,
+			&observation.RedirectStatus,
 			&observation.FirstSeenMS,
 			&observation.LastSeenMS,
 			&observation.Count,
 		); err != nil {
 			return nil, err
 		}
-		if observation.SiteID != siteID || !isCanonicalDynamicObservationAuthority(observation.CanonicalAuthority) || !validDynamicObservationEnums(observation.Source, observation.Decision, observation.ReasonCode) || observation.FirstSeenMS < 0 || observation.LastSeenMS < observation.FirstSeenMS || observation.Count <= 0 {
+		expectedStage, stageOK := dynamicObservationStageForReason(observation.ReasonCode)
+		if observation.SiteID != siteID || !isCanonicalDynamicObservationAuthority(observation.CanonicalAuthority) || !validDynamicObservationEnums(observation.Source, observation.Decision, observation.ReasonCode) || !validDynamicObservationRouteDimensions(observation.Source, observation.TargetKind, observation.RedirectStatus) || !stageOK || observation.Stage != expectedStage || observation.FirstSeenMS < 0 || observation.LastSeenMS < observation.FirstSeenMS || observation.Count <= 0 {
 			return nil, fmt.Errorf("stored dynamic observation failed validation")
 		}
 		observations = append(observations, observation)
@@ -1845,11 +1942,15 @@ func (d *DB) writeDynamicObservationBatch(batch []queuedDynamicObservation) (int
 		siteID             int64
 		canonicalAuthority string
 		source             string
+		targetKind         string
+		stage              string
 		decision           string
 		reasonCode         string
+		redirectStatus     int
 	}
 	type aggregate struct {
 		event       dynamicObservationEvent
+		stage       string
 		firstSeenMS int64
 		lastSeenMS  int64
 		count       int64
@@ -1862,8 +1963,11 @@ func (d *DB) writeDynamicObservationBatch(batch []queuedDynamicObservation) (int
 			siteID:             event.SiteID,
 			canonicalAuthority: event.CanonicalAuthority,
 			source:             event.Source,
+			targetKind:         event.TargetKind,
+			stage:              queued.stage,
 			decision:           event.Decision,
 			reasonCode:         event.ReasonCode,
+			redirectStatus:     event.RedirectStatus,
 		}
 		if index, ok := indexes[key]; ok {
 			current := &aggregated[index]
@@ -1875,6 +1979,7 @@ func (d *DB) writeDynamicObservationBatch(batch []queuedDynamicObservation) (int
 		indexes[key] = len(aggregated)
 		aggregated = append(aggregated, aggregate{
 			event:       event,
+			stage:       queued.stage,
 			firstSeenMS: queued.observedAtMS,
 			lastSeenMS:  queued.observedAtMS,
 			count:       1,
@@ -1888,10 +1993,10 @@ func (d *DB) writeDynamicObservationBatch(batch []queuedDynamicObservation) (int
 	defer tx.Rollback()
 	statement, err := tx.Prepare(`
 		INSERT INTO dynamic_observations
-			(site_id, canonical_authority, source, decision, reason_code, first_seen_ms, last_seen_ms, count)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?
+			(site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status, first_seen_ms, last_seen_ms, count)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE EXISTS (SELECT 1 FROM sites WHERE id=?)
-		ON CONFLICT(site_id, canonical_authority, source, decision, reason_code) DO UPDATE SET
+		ON CONFLICT(site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status) DO UPDATE SET
 			first_seen_ms=MIN(dynamic_observations.first_seen_ms, excluded.first_seen_ms),
 			last_seen_ms=MAX(dynamic_observations.last_seen_ms, excluded.last_seen_ms),
 			count=CASE
@@ -1909,8 +2014,11 @@ func (d *DB) writeDynamicObservationBatch(batch []queuedDynamicObservation) (int
 			event.SiteID,
 			event.CanonicalAuthority,
 			event.Source,
+			event.TargetKind,
+			current.stage,
 			event.Decision,
 			event.ReasonCode,
+			event.RedirectStatus,
 			current.firstSeenMS,
 			current.lastSeenMS,
 			current.count,
@@ -1927,7 +2035,7 @@ func (d *DB) writeDynamicObservationBatch(batch []queuedDynamicObservation) (int
 			skipped += int(current.count)
 		}
 	}
-	if err := pruneDynamicObservationsTx(tx, time.Now()); err != nil {
+	if err := pruneDynamicObservationRows(context.Background(), tx, time.Now()); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1936,17 +2044,37 @@ func (d *DB) writeDynamicObservationBatch(batch []queuedDynamicObservation) (int
 	return skipped, nil
 }
 
-func pruneDynamicObservationsTx(tx *sql.Tx, now time.Time) error {
+type dynamicObservationSQLExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func pruneDynamicObservationRows(ctx context.Context, executor dynamicObservationSQLExecutor, now time.Time) error {
 	cutoffMS := now.Add(-dynamicObservationRetention).UnixMilli()
-	if _, err := tx.Exec("DELETE FROM dynamic_observations WHERE last_seen_ms<?", cutoffMS); err != nil {
+	if _, err := executor.ExecContext(ctx, "DELETE FROM dynamic_observations WHERE last_seen_ms<?", cutoffMS); err != nil {
 		return err
 	}
-	_, err := tx.Exec(`
+	if _, err := executor.ExecContext(ctx, `
 		DELETE FROM dynamic_observations
-		WHERE (site_id, canonical_authority, source, decision, reason_code) IN (
-			SELECT site_id, canonical_authority, source, decision, reason_code
+		WHERE (site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status) IN (
+			SELECT site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status
+			FROM (
+				SELECT site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status,
+					ROW_NUMBER() OVER (
+						PARTITION BY site_id
+						ORDER BY last_seen_ms DESC, first_seen_ms DESC, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status
+					) AS row_number
+				FROM dynamic_observations
+			)
+			WHERE row_number > ?
+		)`, dynamicObservationPerSiteRowLimit); err != nil {
+		return err
+	}
+	_, err := executor.ExecContext(ctx, `
+		DELETE FROM dynamic_observations
+		WHERE (site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status) IN (
+			SELECT site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status
 			FROM dynamic_observations
-			ORDER BY last_seen_ms DESC, first_seen_ms DESC, site_id, canonical_authority, source, decision, reason_code
+			ORDER BY last_seen_ms DESC, first_seen_ms DESC, site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status
 			LIMIT -1 OFFSET ?
 		)`, dynamicObservationGlobalRowLimit)
 	return err
@@ -1958,7 +2086,7 @@ func (d *DB) pruneDynamicObservations() error {
 		return err
 	}
 	defer tx.Rollback()
-	if err := pruneDynamicObservationsTx(tx, time.Now()); err != nil {
+	if err := pruneDynamicObservationRows(context.Background(), tx, time.Now()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -2088,6 +2216,9 @@ func (d *DB) migrateOnce() error {
 	if err := validateDynamicObservationSchema(ctx, conn); err != nil {
 		return err
 	}
+	if err := pruneDynamicObservationRows(ctx, conn, time.Now()); err != nil {
+		return fmt.Errorf("prune dynamic observations during migration: %w", err)
+	}
 
 	for _, migration := range []struct {
 		column string
@@ -2175,7 +2306,78 @@ func sqliteColumnExists(ctx context.Context, conn *sql.Conn, column string) (boo
 	return count > 0, nil
 }
 
-const dynamicObservationTableDDL = `
+const dynamicObservationStageSQLCase = `CASE
+	WHEN reason_code IN ('redirect_allowed', 'unsupported_status', 'response_failure') THEN 'response'
+	WHEN reason_code IN ('invalid_location', 'redirect_loop', 'hop_limit') THEN 'location'
+	WHEN reason_code IN ('candidate_allowed', 'scheme_denied', 'port_denied', 'domain_denied', 'https_downgrade_denied', 'self_target', 'playback_info_denied', 'hls_feature_denied', 'dash_feature_denied') THEN 'policy'
+	WHEN reason_code IN ('dns_failure', 'address_denied') THEN 'resolve'
+	WHEN reason_code IN ('dial_failure', 'tls_failure') THEN 'connect'
+	WHEN reason_code IN ('capacity_limit', 'rate_limit') THEN 'capacity'
+	WHEN reason_code IN ('parse_failure', 'request_unclassified', 'structured_body_limit', 'redirect_body_replay_denied') THEN 'parse'
+	WHEN reason_code IN ('capability_invalid', 'capability_expired') THEN 'capability'
+	WHEN reason_code = 'runtime_unavailable' THEN 'runtime'
+	ELSE NULL
+END`
+
+const dynamicObservationRouteTableDDLPrefix = `
+CREATE TABLE dynamic_observations (
+	site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+	canonical_authority TEXT NOT NULL,
+	source TEXT NOT NULL CHECK(source IN ('redirect', 'playback_info', 'hls', 'dash')),
+	target_kind TEXT NOT NULL CHECK(target_kind IN ('same_authority', 'configured', 'discovered')),
+	stage TEXT NOT NULL CHECK(stage IN ('response', 'location', 'policy', 'resolve', 'connect', 'capacity', 'parse', 'capability', 'runtime'))
+		CHECK(stage = ` + dynamicObservationStageSQLCase + `),
+	decision TEXT NOT NULL CHECK(decision IN ('allowed', 'denied')),
+	reason_code TEXT NOT NULL CHECK(reason_code IN (
+		'redirect_allowed',
+		'candidate_allowed',
+		'invalid_location',
+		'unsupported_status',
+		'redirect_loop',
+		'hop_limit',
+		'scheme_denied',
+		'port_denied',
+		'domain_denied',
+		'https_downgrade_denied',
+		'self_target',
+		'dns_failure',
+		'address_denied',
+		'dial_failure',
+		'tls_failure',
+		'capacity_limit',
+		'rate_limit',
+		'parse_failure',
+		'request_unclassified',
+		'structured_body_limit',
+		'playback_info_denied',
+		'hls_feature_denied',
+		'dash_feature_denied',
+		'redirect_body_replay_denied',
+		'capability_invalid',
+		'capability_expired',
+		'response_failure',
+		'runtime_unavailable'
+	)),
+	redirect_status INTEGER NOT NULL CHECK(redirect_status = 0 OR redirect_status BETWEEN 300 AND 399),
+	first_seen_ms INTEGER NOT NULL CHECK(first_seen_ms >= 0),
+	last_seen_ms INTEGER NOT NULL CHECK(last_seen_ms >= first_seen_ms),
+	count INTEGER NOT NULL CHECK(count > 0),
+	CHECK(
+		(decision = 'allowed' AND reason_code IN ('redirect_allowed', 'candidate_allowed')) OR
+		(decision = 'denied' AND reason_code NOT IN ('redirect_allowed', 'candidate_allowed'))
+	),`
+
+const dynamicObservationRouteTableDDLSuffix = `
+	PRIMARY KEY(site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status)
+) WITHOUT ROWID;`
+
+const dynamicObservationTableDDL = dynamicObservationRouteTableDDLPrefix + `
+	CHECK(source = 'redirect' OR redirect_status = 0),` + dynamicObservationRouteTableDDLSuffix
+
+const dynamicObservationPreviousTableDDL = dynamicObservationRouteTableDDLPrefix + `
+	CHECK(source = 'redirect' OR (target_kind = 'discovered' AND redirect_status = 0)),` + dynamicObservationRouteTableDDLSuffix
+
+const dynamicObservationV19TableDDL = `
 CREATE TABLE dynamic_observations (
 	site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
 	canonical_authority TEXT NOT NULL,
@@ -2217,6 +2419,44 @@ CREATE TABLE dynamic_observations (
 	PRIMARY KEY(site_id, canonical_authority, source, decision, reason_code)
 ) WITHOUT ROWID;`
 
+const dynamicObservationV18TableDDL = `
+CREATE TABLE dynamic_observations (
+	site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+	canonical_authority TEXT NOT NULL,
+	source TEXT NOT NULL CHECK(source IN ('redirect', 'playback_info', 'hls', 'dash')),
+	decision TEXT NOT NULL CHECK(decision IN ('allowed', 'denied')),
+	reason_code TEXT NOT NULL CHECK(reason_code IN (
+		'redirect_allowed', 'candidate_allowed', 'invalid_location', 'unsupported_status',
+		'redirect_loop', 'hop_limit', 'scheme_denied', 'port_denied', 'domain_denied',
+		'https_downgrade_denied', 'self_target', 'dns_failure', 'address_denied',
+		'dial_failure', 'tls_failure', 'capacity_limit', 'rate_limit', 'parse_failure',
+		'capability_invalid', 'capability_expired', 'response_failure', 'runtime_unavailable'
+	)),
+	first_seen_ms INTEGER NOT NULL CHECK(first_seen_ms >= 0),
+	last_seen_ms INTEGER NOT NULL CHECK(last_seen_ms >= first_seen_ms),
+	count INTEGER NOT NULL CHECK(count > 0),
+	PRIMARY KEY(site_id, canonical_authority, source, decision, reason_code)
+) WITHOUT ROWID;`
+
+const dynamicObservationLegacyTableDDL = `
+CREATE TABLE dynamic_observations (
+	site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+	canonical_authority TEXT NOT NULL,
+	source TEXT NOT NULL CHECK(source = 'redirect'),
+	decision TEXT NOT NULL CHECK(decision IN ('allowed', 'denied')),
+	reason_code TEXT NOT NULL CHECK(reason_code IN (
+		'redirect_allowed', 'invalid_location', 'unsupported_status', 'redirect_loop',
+		'hop_limit', 'scheme_denied', 'port_denied', 'domain_denied',
+		'https_downgrade_denied', 'self_target', 'dns_failure', 'address_denied',
+		'dial_failure', 'tls_failure', 'capacity_limit', 'rate_limit',
+		'response_failure', 'runtime_unavailable'
+	)),
+	first_seen_ms INTEGER NOT NULL CHECK(first_seen_ms >= 0),
+	last_seen_ms INTEGER NOT NULL CHECK(last_seen_ms >= first_seen_ms),
+	count INTEGER NOT NULL CHECK(count > 0),
+	PRIMARY KEY(site_id, canonical_authority, source, decision, reason_code)
+) WITHOUT ROWID;`
+
 const dynamicObservationIndexesDDL = `
 CREATE INDEX IF NOT EXISTS idx_dynamic_observations_site_last_seen
 	ON dynamic_observations(site_id, last_seen_ms DESC);
@@ -2226,6 +2466,8 @@ CREATE INDEX IF NOT EXISTS idx_dynamic_observations_last_seen
 const (
 	dynamicObservationSchemaCurrent  = "current"
 	dynamicObservationSchemaPrevious = "previous"
+	dynamicObservationSchemaV19      = "v1.9"
+	dynamicObservationSchemaV18      = "v1.8"
 	dynamicObservationSchemaLegacy   = "legacy"
 	dynamicObservationSchemaInvalid  = "invalid"
 )
@@ -2238,92 +2480,50 @@ func compactSQLiteDDL(value string) string {
 			compact.WriteRune(character)
 		}
 	}
-	return compact.String()
+	return strings.TrimSuffix(compact.String(), ";")
 }
 
 func dynamicObservationSchemaState(tableSQL string) string {
 	compact := compactSQLiteDDL(tableSQL)
-	common := []string{
-		"check(decisionin('allowed','denied'))",
-		"check(first_seen_ms>=0)",
-		"check(last_seen_ms>=first_seen_ms)",
-		"check(count>0)",
-		"site_idintegernotnullreferencessites(id)ondeletecascade",
-		")withoutrowid",
-	}
-	for _, fragment := range common {
-		if !strings.Contains(compact, fragment) {
-			return dynamicObservationSchemaInvalid
-		}
-	}
-	currentSource := "check(sourcein('redirect','playback_info','hls','dash'))"
-	currentReasons := "check(reason_codein('redirect_allowed','candidate_allowed','invalid_location','unsupported_status','redirect_loop','hop_limit','scheme_denied','port_denied','domain_denied','https_downgrade_denied','self_target','dns_failure','address_denied','dial_failure','tls_failure','capacity_limit','rate_limit','parse_failure','request_unclassified','structured_body_limit','playback_info_denied','hls_feature_denied','dash_feature_denied','redirect_body_replay_denied','capability_invalid','capability_expired','response_failure','runtime_unavailable'))"
-	if strings.Contains(compact, currentSource) && strings.Contains(compact, currentReasons) {
+	switch compact {
+	case compactSQLiteDDL(dynamicObservationTableDDL):
 		return dynamicObservationSchemaCurrent
-	}
-	previousReasons := "check(reason_codein('redirect_allowed','candidate_allowed','invalid_location','unsupported_status','redirect_loop','hop_limit','scheme_denied','port_denied','domain_denied','https_downgrade_denied','self_target','dns_failure','address_denied','dial_failure','tls_failure','capacity_limit','rate_limit','parse_failure','capability_invalid','capability_expired','response_failure','runtime_unavailable'))"
-	if strings.Contains(compact, currentSource) && strings.Contains(compact, previousReasons) {
+	case compactSQLiteDDL(dynamicObservationPreviousTableDDL):
 		return dynamicObservationSchemaPrevious
-	}
-	legacySource := "check(source='redirect')"
-	legacyReasons := "check(reason_codein('redirect_allowed','invalid_location','unsupported_status','redirect_loop','hop_limit','scheme_denied','port_denied','domain_denied','https_downgrade_denied','self_target','dns_failure','address_denied','dial_failure','tls_failure','capacity_limit','rate_limit','response_failure','runtime_unavailable'))"
-	if strings.Contains(compact, legacySource) && strings.Contains(compact, legacyReasons) {
+	case compactSQLiteDDL(dynamicObservationV19TableDDL):
+		return dynamicObservationSchemaV19
+	case compactSQLiteDDL(dynamicObservationV18TableDDL):
+		return dynamicObservationSchemaV18
+	case compactSQLiteDDL(dynamicObservationLegacyTableDDL):
 		return dynamicObservationSchemaLegacy
-	}
-	return dynamicObservationSchemaInvalid
-}
-
-func ensureDynamicObservationSchema(ctx context.Context, conn *sql.Conn) error {
-	var tableSQL string
-	err := conn.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type='table' AND name='dynamic_observations'").Scan(&tableSQL)
-	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := conn.ExecContext(ctx, dynamicObservationTableDDL+dynamicObservationIndexesDDL); err != nil {
-			return fmt.Errorf("create dynamic_observations schema: %w", err)
-		}
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("inspect dynamic_observations table SQL: %w", err)
-	}
-	switch dynamicObservationSchemaState(tableSQL) {
-	case dynamicObservationSchemaCurrent:
-		if _, err := conn.ExecContext(ctx, dynamicObservationIndexesDDL); err != nil {
-			return fmt.Errorf("create dynamic observation indexes: %w", err)
-		}
-		return nil
-	case dynamicObservationSchemaPrevious, dynamicObservationSchemaLegacy:
-		var staleTable int
-		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='dynamic_observations_legacy'").Scan(&staleTable); err != nil {
-			return fmt.Errorf("inspect legacy dynamic observation table: %w", err)
-		}
-		if staleTable != 0 {
-			return fmt.Errorf("dynamic_observations_legacy already exists")
-		}
-		migrationSQL := `
-ALTER TABLE dynamic_observations RENAME TO dynamic_observations_legacy;
-` + dynamicObservationTableDDL + `
-INSERT INTO dynamic_observations
-	(site_id, canonical_authority, source, decision, reason_code, first_seen_ms, last_seen_ms, count)
-SELECT site_id, canonical_authority, source, decision, reason_code, first_seen_ms, last_seen_ms, count
-FROM dynamic_observations_legacy;
-DROP TABLE dynamic_observations_legacy;
-` + dynamicObservationIndexesDDL
-		if _, err := conn.ExecContext(ctx, migrationSQL); err != nil {
-			return fmt.Errorf("migrate dynamic_observations enum constraints: %w", err)
-		}
-		return nil
 	default:
-		return fmt.Errorf("dynamic_observations contains unrecognized or unsafe constraints")
+		return dynamicObservationSchemaInvalid
 	}
 }
 
-func validateDynamicObservationSchema(ctx context.Context, conn *sql.Conn) error {
-	type columnSpec struct {
-		name               string
-		typeName           string
-		primaryKeyPosition int
+type dynamicObservationColumnSpec struct {
+	name               string
+	typeName           string
+	primaryKeyPosition int
+}
+
+func dynamicObservationExpectedColumns(state string) []dynamicObservationColumnSpec {
+	if state == dynamicObservationSchemaCurrent || state == dynamicObservationSchemaPrevious {
+		return []dynamicObservationColumnSpec{
+			{name: "site_id", typeName: "INTEGER", primaryKeyPosition: 1},
+			{name: "canonical_authority", typeName: "TEXT", primaryKeyPosition: 2},
+			{name: "source", typeName: "TEXT", primaryKeyPosition: 3},
+			{name: "target_kind", typeName: "TEXT", primaryKeyPosition: 4},
+			{name: "stage", typeName: "TEXT", primaryKeyPosition: 5},
+			{name: "decision", typeName: "TEXT", primaryKeyPosition: 6},
+			{name: "reason_code", typeName: "TEXT", primaryKeyPosition: 7},
+			{name: "redirect_status", typeName: "INTEGER", primaryKeyPosition: 8},
+			{name: "first_seen_ms", typeName: "INTEGER"},
+			{name: "last_seen_ms", typeName: "INTEGER"},
+			{name: "count", typeName: "INTEGER"},
+		}
 	}
-	expected := []columnSpec{
+	return []dynamicObservationColumnSpec{
 		{name: "site_id", typeName: "INTEGER", primaryKeyPosition: 1},
 		{name: "canonical_authority", typeName: "TEXT", primaryKeyPosition: 2},
 		{name: "source", typeName: "TEXT", primaryKeyPosition: 3},
@@ -2333,6 +2533,10 @@ func validateDynamicObservationSchema(ctx context.Context, conn *sql.Conn) error
 		{name: "last_seen_ms", typeName: "INTEGER"},
 		{name: "count", typeName: "INTEGER"},
 	}
+}
+
+func validateDynamicObservationColumns(ctx context.Context, conn *sql.Conn, state string) error {
+	expected := dynamicObservationExpectedColumns(state)
 	rows, err := conn.QueryContext(ctx, `
 		SELECT name, upper(type), "notnull", dflt_value, pk
 		FROM pragma_table_info('dynamic_observations')
@@ -2370,34 +2574,82 @@ func validateDynamicObservationSchema(ctx context.Context, conn *sql.Conn) error
 	if position != len(expected) {
 		return fmt.Errorf("dynamic_observations is missing required columns")
 	}
+	return nil
+}
 
-	var tableSQL string
-	if err := conn.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type='table' AND name='dynamic_observations'").Scan(&tableSQL); err != nil {
-		return fmt.Errorf("inspect dynamic_observations table SQL: %w", err)
-	}
-	if dynamicObservationSchemaState(tableSQL) != dynamicObservationSchemaCurrent {
-		return fmt.Errorf("dynamic_observations enum constraints are invalid")
-	}
-
-	for _, index := range []struct {
+func validateDynamicObservationIndexes(ctx context.Context, conn *sql.Conn) error {
+	type indexSpec struct {
 		name    string
 		columns []string
-	}{
-		{name: "idx_dynamic_observations_site_last_seen", columns: []string{"site_id", "last_seen_ms"}},
-		{name: "idx_dynamic_observations_last_seen", columns: []string{"last_seen_ms"}},
-	} {
-		indexRows, err := conn.QueryContext(ctx, "SELECT name FROM pragma_index_info(?) ORDER BY seqno", index.name)
+		desc    []int
+	}
+	expected := []indexSpec{
+		{name: "idx_dynamic_observations_site_last_seen", columns: []string{"site_id", "last_seen_ms"}, desc: []int{0, 1}},
+		{name: "idx_dynamic_observations_last_seen", columns: []string{"last_seen_ms"}, desc: []int{0}},
+	}
+	expectedNames := make(map[string]bool, len(expected))
+	for _, index := range expected {
+		expectedNames[index.name] = true
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT name, "unique", origin, partial FROM pragma_index_list('dynamic_observations') ORDER BY name`)
+	if err != nil {
+		return fmt.Errorf("inspect dynamic observation indexes: %w", err)
+	}
+	seen := make(map[string]bool, len(expected))
+	primaryIndexes := 0
+	for rows.Next() {
+		var name, origin string
+		var unique, partial int
+		if err := rows.Scan(&name, &unique, &origin, &partial); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("inspect dynamic observation index: %w", err)
+		}
+		if origin == "pk" {
+			if unique != 1 || partial != 0 {
+				_ = rows.Close()
+				return fmt.Errorf("dynamic observation primary index has an invalid definition")
+			}
+			primaryIndexes++
+			continue
+		}
+		if origin != "c" || unique != 0 || partial != 0 || !expectedNames[name] || seen[name] {
+			_ = rows.Close()
+			return fmt.Errorf("dynamic observations contains an unexpected index %q", name)
+		}
+		seen[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("inspect dynamic observation indexes: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close dynamic observation index rows: %w", err)
+	}
+	if primaryIndexes != 1 || len(seen) != len(expected) {
+		return fmt.Errorf("dynamic observation indexes are incomplete")
+	}
+	for _, index := range expected {
+		indexRows, err := conn.QueryContext(ctx, `SELECT name, "desc" FROM pragma_index_xinfo(?) WHERE "key"=1 ORDER BY seqno`, index.name)
 		if err != nil {
 			return fmt.Errorf("inspect dynamic observation index %s: %w", index.name, err)
 		}
-		columns := make([]string, 0, len(index.columns))
+		position := 0
 		for indexRows.Next() {
-			var column string
-			if err := indexRows.Scan(&column); err != nil {
+			if position >= len(index.columns) {
+				_ = indexRows.Close()
+				return fmt.Errorf("dynamic observation index %s has an invalid definition", index.name)
+			}
+			var column sql.NullString
+			var descending int
+			if err := indexRows.Scan(&column, &descending); err != nil {
 				_ = indexRows.Close()
 				return fmt.Errorf("inspect dynamic observation index %s: %w", index.name, err)
 			}
-			columns = append(columns, column)
+			if !column.Valid || column.String != index.columns[position] || descending != index.desc[position] {
+				_ = indexRows.Close()
+				return fmt.Errorf("dynamic observation index %s has an invalid definition", index.name)
+			}
+			position++
 		}
 		if err := indexRows.Err(); err != nil {
 			_ = indexRows.Close()
@@ -2406,16 +2658,82 @@ func validateDynamicObservationSchema(ctx context.Context, conn *sql.Conn) error
 		if err := indexRows.Close(); err != nil {
 			return fmt.Errorf("close dynamic observation index %s rows: %w", index.name, err)
 		}
-		if len(columns) != len(index.columns) {
+		if position != len(index.columns) {
 			return fmt.Errorf("dynamic observation index %s has an invalid definition", index.name)
-		}
-		for i := range columns {
-			if columns[i] != index.columns[i] {
-				return fmt.Errorf("dynamic observation index %s has an invalid definition", index.name)
-			}
 		}
 	}
 	return nil
+}
+
+func validateDynamicObservationSchemaShape(ctx context.Context, conn *sql.Conn, state string) error {
+	if err := validateDynamicObservationColumns(ctx, conn, state); err != nil {
+		return err
+	}
+	return validateDynamicObservationIndexes(ctx, conn)
+}
+
+func ensureDynamicObservationSchema(ctx context.Context, conn *sql.Conn) error {
+	var tableSQL string
+	err := conn.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type='table' AND name='dynamic_observations'").Scan(&tableSQL)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err := conn.ExecContext(ctx, dynamicObservationTableDDL+dynamicObservationIndexesDDL); err != nil {
+			return fmt.Errorf("create dynamic_observations schema: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect dynamic_observations table SQL: %w", err)
+	}
+	state := dynamicObservationSchemaState(tableSQL)
+	if state == dynamicObservationSchemaCurrent {
+		return nil
+	}
+	var migrationProjection string
+	switch state {
+	case dynamicObservationSchemaPrevious:
+		migrationProjection = "site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status, first_seen_ms, last_seen_ms, count"
+	case dynamicObservationSchemaV19, dynamicObservationSchemaV18, dynamicObservationSchemaLegacy:
+		// Schemas before route dimensions did not retain enough information to
+		// reconstruct target classification or redirect status.
+		migrationProjection = "site_id, canonical_authority, source, 'discovered', " + dynamicObservationStageSQLCase + ", decision, reason_code, 0, first_seen_ms, last_seen_ms, count"
+	default:
+		return fmt.Errorf("dynamic_observations contains unrecognized or unsafe constraints")
+	}
+	if err := validateDynamicObservationSchemaShape(ctx, conn, state); err != nil {
+		return fmt.Errorf("validate previous dynamic_observations schema: %w", err)
+	}
+	var staleTable int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='dynamic_observations_legacy'").Scan(&staleTable); err != nil {
+		return fmt.Errorf("inspect legacy dynamic observation table: %w", err)
+	}
+	if staleTable != 0 {
+		return fmt.Errorf("dynamic_observations_legacy already exists")
+	}
+	// #nosec G202 -- every fragment is a compile-time constant selected only after the legacy schema shape has been validated; no request or database value is interpolated.
+	migrationSQL := `
+ALTER TABLE dynamic_observations RENAME TO dynamic_observations_legacy;
+` + dynamicObservationTableDDL + `
+INSERT INTO dynamic_observations
+	(site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status, first_seen_ms, last_seen_ms, count)
+SELECT ` + migrationProjection + `
+FROM dynamic_observations_legacy;
+DROP TABLE dynamic_observations_legacy;
+` + dynamicObservationIndexesDDL
+	if _, err := conn.ExecContext(ctx, migrationSQL); err != nil {
+		return fmt.Errorf("migrate dynamic_observations route dimensions: %w", err)
+	}
+	return nil
+}
+
+func validateDynamicObservationSchema(ctx context.Context, conn *sql.Conn) error {
+	var tableSQL string
+	if err := conn.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type='table' AND name='dynamic_observations'").Scan(&tableSQL); err != nil {
+		return fmt.Errorf("inspect dynamic_observations table SQL: %w", err)
+	}
+	if dynamicObservationSchemaState(tableSQL) != dynamicObservationSchemaCurrent {
+		return fmt.Errorf("dynamic_observations constraints are invalid")
+	}
+	return validateDynamicObservationSchemaShape(ctx, conn, dynamicObservationSchemaCurrent)
 }
 
 type Site struct {
@@ -3954,12 +4272,24 @@ func (i *dynamicCapabilityIssuer) observe(source, decision, reasonCode, authorit
 	if i == nil || i.database == nil || authority == "" {
 		return
 	}
+	targetKind := dynamicObservationTargetDiscovered
+	if target, err := url.Parse(authority); err == nil && dynamicCanonicalAuthority(target) == authority {
+		authorityKey := redirectHostKey(target)
+		switch {
+		case authorityKey != "" && authorityKey == i.primaryAuthority:
+			targetKind = dynamicObservationTargetSameAuthority
+		case authorityKey != "" && i.configuredAuthorities[authorityKey]:
+			targetKind = dynamicObservationTargetConfigured
+		}
+	}
 	i.database.EnqueueDynamicObservation(dynamicObservationEvent{
 		SiteID:             i.siteID,
 		CanonicalAuthority: authority,
 		Source:             source,
+		TargetKind:         targetKind,
 		Decision:           decision,
 		ReasonCode:         reasonCode,
+		RedirectStatus:     0,
 	})
 }
 
@@ -8591,13 +8921,13 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		}
 		configuredAuthorities := map[string]bool{}
 		playbackHosts := map[string]bool{}
-		disableLegacyRedirects := true
+		disableManualRedirects := true
 		uaPolicy := UAHeaderPolicy{}
 		upstreamPolicy := upstreamHeaderPolicy{}
 		if claims.Trusted {
 			configuredAuthorities = i.configuredAuthorities
 			playbackHosts = i.configuredAuthorities
-			disableLegacyRedirects = false
+			disableManualRedirects = false
 			uaPolicy = i.uaPolicy
 			upstreamPolicy = i.upstreamHeaderPolicy
 		}
@@ -8605,7 +8935,7 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 			base:                    transport,
 			playbackHosts:           playbackHosts,
 			configuredAuthorities:   configuredAuthorities,
-			disableLegacyRedirects:  disableLegacyRedirects,
+			disableManualRedirects:  disableManualRedirects,
 			policy:                  uaPolicy,
 			upstreamHeaderPolicy:    upstreamPolicy,
 			dynamicPolicy:           i.policy,
@@ -8737,7 +9067,7 @@ type redirectFollowTransport struct {
 	base                    http.RoundTripper
 	playbackHosts           map[string]bool
 	configuredAuthorities   map[string]bool
-	disableLegacyRedirects  bool
+	disableManualRedirects  bool
 	policy                  UAHeaderPolicy
 	upstreamHeaderPolicy    upstreamHeaderPolicy
 	dynamicTransportFactory dynamicTransportFactory
@@ -8945,7 +9275,40 @@ func crossAuthorityWebSocketHeaders(source http.Header) http.Header {
 	return header
 }
 
-func (t *redirectFollowTransport) observe(decision, reasonCode, authority string) {
+func (t *redirectFollowTransport) redirectObservationTarget(from, target *url.URL) (string, string) {
+	if target == nil {
+		return dynamicObservationTargetSameAuthority, dynamicCanonicalAuthority(from)
+	}
+	authority := dynamicCanonicalAuthority(target)
+	if authority == "" {
+		return dynamicObservationTargetSameAuthority, dynamicCanonicalAuthority(from)
+	}
+	if sameRedirectAuthority(from, target) {
+		return dynamicObservationTargetSameAuthority, authority
+	}
+	key := redirectHostKey(target)
+	if t.configuredAuthorities[key] || t.playbackHosts[key] {
+		return dynamicObservationTargetConfigured, authority
+	}
+	return dynamicObservationTargetDiscovered, authority
+}
+
+func (t *redirectFollowTransport) redirectObservationTargetFromResponse(req *http.Request, resp *http.Response) (string, string) {
+	if req == nil {
+		return dynamicObservationTargetDiscovered, ""
+	}
+	location, ok := singleDynamicLocation(resp)
+	if !ok {
+		return t.redirectObservationTarget(req.URL, nil)
+	}
+	target, err := url.Parse(location)
+	if err != nil {
+		return t.redirectObservationTarget(req.URL, nil)
+	}
+	return t.redirectObservationTarget(req.URL, req.URL.ResolveReference(target))
+}
+
+func (t *redirectFollowTransport) observe(targetKind, decision, reasonCode, authority string, redirectStatus int) {
 	if t.database == nil || authority == "" {
 		return
 	}
@@ -8953,13 +9316,15 @@ func (t *redirectFollowTransport) observe(decision, reasonCode, authority string
 		SiteID:             t.siteID,
 		CanonicalAuthority: authority,
 		Source:             dynamicObservationSourceRedirect,
+		TargetKind:         targetKind,
 		Decision:           decision,
 		ReasonCode:         reasonCode,
+		RedirectStatus:     redirectStatus,
 	})
 }
 
-func (t *redirectFollowTransport) denied(reasonCode, authority string) error {
-	t.observe(dynamicObservationDecisionDenied, reasonCode, authority)
+func (t *redirectFollowTransport) denied(reasonCode, targetKind, authority string, redirectStatus int) error {
+	t.observe(targetKind, dynamicObservationDecisionDenied, reasonCode, authority, redirectStatus)
 	return newDynamicProxyError(reasonCode)
 }
 
@@ -8973,48 +9338,130 @@ func dynamicRedirectURLKey(target *url.URL) string {
 	return target.String()
 }
 
-func (t *redirectFollowTransport) roundTripLegacy(req *http.Request, resp *http.Response) (*http.Response, error) {
-	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+const manualRedirectMaxHops = 5
+
+func manualHandledRedirectStatus(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently,
+		http.StatusFound,
+		http.StatusSeeOther,
+		http.StatusTemporaryRedirect,
+		http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
+}
+
+func isManualRedirectEligibleRequest(r *http.Request) bool {
+	return r != nil && r.URL != nil &&
+		(r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		!hasUpgradeIntent(r) && !isReservedDynamicRoute(r.URL.Path)
+}
+
+func (t *redirectFollowTransport) responseTargetsConfiguredPlayback(req *http.Request, resp *http.Response) bool {
+	if t == nil || req == nil || req.URL == nil || resp == nil || resp.StatusCode < 300 || resp.StatusCode >= 400 || resp.StatusCode == http.StatusNotModified {
+		return false
+	}
+	location, ok := singleDynamicLocation(resp)
+	if !ok {
+		return false
+	}
+	target, err := url.Parse(location)
+	if err != nil {
+		return false
+	}
+	target = req.URL.ResolveReference(target)
+	target.Scheme = strings.ToLower(target.Scheme)
+	return target.User == nil && (target.Scheme == "http" || target.Scheme == "https") &&
+		t.playbackHosts[redirectHostKey(target)]
+}
+
+func (t *redirectFollowTransport) roundTripManual(req *http.Request, resp *http.Response) (*http.Response, error) {
+	if !isManualRedirectEligibleRequest(req) {
+		if resp != nil && resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.StatusCode != http.StatusNotModified {
+			targetKind, authority := t.redirectObservationTargetFromResponse(req, resp)
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicObservationReasonRequestUnclassified, authority, resp.StatusCode)
+		}
 		return resp, nil
 	}
-	for range 3 {
-		if resp.StatusCode != 301 && resp.StatusCode != 302 && resp.StatusCode != 307 && resp.StatusCode != 308 {
-			break
+
+	visited := map[string]struct{}{dynamicRedirectURLKey(req.URL): {}}
+	followed := 0
+	for {
+		if resp == nil {
+			return nil, errors.New("manual redirect response is nil")
 		}
-		loc := resp.Header.Get("Location")
-		if loc == "" {
-			break
+		if !manualHandledRedirectStatus(resp.StatusCode) {
+			if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.StatusCode != http.StatusNotModified {
+				targetKind, authority := t.redirectObservationTargetFromResponse(req, resp)
+				t.observe(targetKind, dynamicObservationDecisionDenied, dynamicObservationReasonUnsupportedStatus, authority, resp.StatusCode)
+			}
+			return resp, nil
 		}
-		locURL, err := url.Parse(loc)
+
+		redirectStatus := resp.StatusCode
+		location, ok := singleDynamicLocation(resp)
+		if !ok {
+			targetKind, authority := t.redirectObservationTarget(req.URL, nil)
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicObservationReasonInvalidLocation, authority, redirectStatus)
+			return resp, nil
+		}
+		locationURL, err := url.Parse(location)
 		if err != nil {
-			break
+			targetKind, authority := t.redirectObservationTarget(req.URL, nil)
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicObservationReasonInvalidLocation, authority, redirectStatus)
+			return resp, nil
 		}
-		locURL = req.URL.ResolveReference(locURL)
-		locURL.Scheme = strings.ToLower(locURL.Scheme)
-		if (locURL.Scheme != "http" && locURL.Scheme != "https") || locURL.User != nil || !t.playbackHosts[redirectHostKey(locURL)] {
-			break
+		locationURL = req.URL.ResolveReference(locationURL)
+		locationURL.Scheme = strings.ToLower(locationURL.Scheme)
+		targetKind, authority := t.redirectObservationTarget(req.URL, locationURL)
+		if locationURL.User != nil || locationURL.Fragment != "" || locationURL.RawFragment != "" ||
+			locationURL.Scheme != "http" && locationURL.Scheme != "https" {
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicObservationReasonInvalidLocation, authority, redirectStatus)
+			return resp, nil
 		}
-		resp.Body.Close()
-		// #nosec G704 -- the redirect authority must match an administrator-configured playback authority.
-		newReq, err := http.NewRequestWithContext(req.Context(), req.Method, locURL.String(), nil)
+		if !t.playbackHosts[redirectHostKey(locationURL)] {
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicObservationReasonDomainDenied, authority, redirectStatus)
+			return resp, nil
+		}
+		key := dynamicRedirectURLKey(locationURL)
+		if _, seen := visited[key]; seen {
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicObservationReasonRedirectLoop, authority, redirectStatus)
+			return resp, nil
+		}
+		if followed >= manualRedirectMaxHops {
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicObservationReasonHopLimit, authority, redirectStatus)
+			return resp, nil
+		}
+
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		// #nosec G704 -- every redirect authority must exactly match an administrator-configured playback authority.
+		newReq, err := http.NewRequestWithContext(req.Context(), req.Method, locationURL.String(), nil)
 		if err != nil {
-			break
-		}
-		newReq.Host = locURL.Host
-		if !sameRedirectAuthority(req.URL, locURL) {
-			newReq.Header = crossAuthorityRedirectHeaders(req.Header)
-		} else {
-			newReq.Header = req.Header.Clone()
-		}
-		applyUAHeaderPolicy(newReq.Header, t.policy)
-		t.upstreamHeaderPolicy.apply(newReq.Header, locURL)
-		resp, err = t.base.RoundTrip(newReq)
-		if err != nil {
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicObservationReasonInvalidLocation, authority, redirectStatus)
 			return nil, err
 		}
+		newReq.Host = locationURL.Host
+		if sameRedirectAuthority(req.URL, locationURL) {
+			newReq.Header = req.Header.Clone()
+		} else {
+			newReq.Header = crossAuthorityRedirectHeaders(req.Header)
+		}
+		applyUAHeaderPolicy(newReq.Header, t.policy)
+		t.upstreamHeaderPolicy.apply(newReq.Header, locationURL)
+		resp, err = t.base.RoundTrip(newReq)
+		if err != nil {
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicTransportFailureReason(err), authority, redirectStatus)
+			return nil, err
+		}
+		t.observe(targetKind, dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, authority, redirectStatus)
 		req = newReq
+		followed++
+		visited[key] = struct{}{}
 	}
-	return resp, nil
 }
 
 func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http.Response) (*http.Response, error) {
@@ -9040,29 +9487,30 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		}
 	}
 	expectedStructuredSource, _ := req.Context().Value(dynamicExpectedStructuredSourceContextKey{}).(string)
-	fail := func(reasonCode, authority string) (*http.Response, error) {
+	fail := func(reasonCode, targetKind, authority string, redirectStatus int) (*http.Response, error) {
 		closeResponse()
 		lease.rollback()
 		if streamRelease != nil {
 			streamRelease()
 			streamRelease = nil
 		}
-		return nil, t.denied(reasonCode, authority)
+		return nil, t.denied(reasonCode, targetKind, authority, redirectStatus)
 	}
 
 	for {
 		if resp == nil {
-			return fail(dynamicObservationReasonResponseFailure, dynamicCanonicalAuthority(req.URL))
+			return fail(dynamicObservationReasonResponseFailure, dynamicObservationTargetDiscovered, dynamicCanonicalAuthority(req.URL), 0)
 		}
 		if dynamicRejectedRedirectStatus(resp.StatusCode, t.dynamicPolicy.profile) {
-			return fail(dynamicObservationReasonUnsupportedStatus, dynamicCanonicalAuthority(req.URL))
+			targetKind, authority := t.redirectObservationTargetFromResponse(req, resp)
+			return fail(dynamicObservationReasonUnsupportedStatus, targetKind, authority, resp.StatusCode)
 		}
 		if !dynamicHandledRedirectStatus(resp.StatusCode, t.dynamicPolicy.profile) {
 			if !dynamicActive {
 				return resp, nil
 			}
 			if resp.StatusCode == http.StatusSwitchingProtocols {
-				return fail(dynamicObservationReasonResponseFailure, dynamicCanonicalAuthority(req.URL))
+				return fail(dynamicObservationReasonResponseFailure, dynamicObservationTargetDiscovered, dynamicCanonicalAuthority(req.URL), 0)
 			}
 			if resp.Body == nil {
 				resp.Body = http.NoBody
@@ -9088,37 +9536,35 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			return resp, nil
 		}
 
+		redirectStatus := resp.StatusCode
 		location, ok := singleDynamicLocation(resp)
 		if !ok {
-			return fail(dynamicObservationReasonInvalidLocation, dynamicCanonicalAuthority(req.URL))
+			targetKind, authority := t.redirectObservationTarget(req.URL, nil)
+			return fail(dynamicObservationReasonInvalidLocation, targetKind, authority, redirectStatus)
 		}
 		locationURL, err := url.Parse(location)
 		if err != nil {
-			return fail(dynamicObservationReasonInvalidLocation, dynamicCanonicalAuthority(req.URL))
+			targetKind, authority := t.redirectObservationTarget(req.URL, nil)
+			return fail(dynamicObservationReasonInvalidLocation, targetKind, authority, redirectStatus)
 		}
 		locationURL = req.URL.ResolveReference(locationURL)
 		locationURL.Scheme = strings.ToLower(locationURL.Scheme)
-		manualAuthority := redirectHostKey(locationURL)
 		sameAuthority := sameRedirectAuthority(req.URL, locationURL)
-		unknownAuthority := !sameAuthority && !t.configuredAuthorities[manualAuthority]
+		targetKind, observationAuthority := t.redirectObservationTarget(req.URL, locationURL)
 		if !dynamicActive && sameAuthority {
-			observationAuthority := dynamicCanonicalAuthority(locationURL)
-			if observationAuthority == "" {
-				observationAuthority = dynamicCanonicalAuthority(req.URL)
-			}
 			if locationURL.User != nil || locationURL.Scheme != "http" && locationURL.Scheme != "https" {
-				return fail(dynamicObservationReasonInvalidLocation, observationAuthority)
+				return fail(dynamicObservationReasonInvalidLocation, targetKind, observationAuthority, redirectStatus)
 			}
 			key := dynamicRedirectURLKey(locationURL)
 			if _, seen := visited[key]; seen {
-				return fail(dynamicObservationReasonRedirectLoop, observationAuthority)
+				return fail(dynamicObservationReasonRedirectLoop, targetKind, observationAuthority, redirectStatus)
 			}
 			if redirectsFollowed >= t.dynamicPolicy.limits.MaxRedirects {
-				return fail(dynamicObservationReasonHopLimit, observationAuthority)
+				return fail(dynamicObservationReasonHopLimit, targetKind, observationAuthority, redirectStatus)
 			}
-			newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(req.Context(), req, resp.StatusCode, locationURL)
+			newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(req.Context(), req, redirectStatus, locationURL)
 			if reasonCode != "" {
-				return fail(reasonCode, observationAuthority)
+				return fail(reasonCode, targetKind, observationAuthority, redirectStatus)
 			}
 			newReq.Header = req.Header.Clone()
 			applyUAHeaderPolicy(newReq.Header, t.policy)
@@ -9132,87 +9578,53 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			// #nosec G704 -- this redirect remains on the already configured upstream authority.
 			resp, err = t.base.RoundTrip(newReq)
 			if err != nil {
+				t.observe(targetKind, dynamicObservationDecisionDenied, dynamicTransportFailureReason(err), observationAuthority, redirectStatus)
 				return nil, err
 			}
+			t.observe(targetKind, dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, observationAuthority, redirectStatus)
 			req = newReq
 			redirectsFollowed++
 			visited[key] = struct{}{}
 			continue
 		}
 
-		if !dynamicActive && !unknownAuthority {
-			if t.disableLegacyRedirects || !t.playbackHosts[manualAuthority] || redirectsFollowed >= 3 {
-				return resp, nil
-			}
-			newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(req.Context(), req, resp.StatusCode, locationURL)
-			if reasonCode != "" {
-				return fail(reasonCode, dynamicCanonicalAuthority(req.URL))
-			}
-			if !sameRedirectAuthority(req.URL, locationURL) {
-				if newReq.Body != nil {
-					newReq.Header = crossAuthorityRedirectBodyHeaders(req.Header)
-				} else {
-					newReq.Header = crossAuthorityRedirectHeaders(req.Header)
-				}
-			} else {
-				newReq.Header = req.Header.Clone()
-			}
-			applyUAHeaderPolicy(newReq.Header, t.policy)
-			t.upstreamHeaderPolicy.apply(newReq.Header, locationURL)
-			if stripBodyHeaders {
-				stripExtremeDynamicRedirectBodyHeaders(newReq.Header)
-			}
-			if resp.Body != nil {
-				_ = resp.Body.Close()
-			}
-			// #nosec G704 -- the redirect authority must match an administrator-configured playback authority.
-			resp, err = t.base.RoundTrip(newReq)
-			if err != nil {
-				return nil, err
-			}
-			req = newReq
-			redirectsFollowed++
-			visited[dynamicRedirectURLKey(locationURL)] = struct{}{}
-			continue
-		}
-
 		if !t.dynamicPolicy.sourceEnabled(dynamicDiscoverySourceRedirect) {
-			return fail(dynamicObservationReasonUnsupportedStatus, dynamicCanonicalAuthority(req.URL))
+			return fail(dynamicObservationReasonUnsupportedStatus, targetKind, observationAuthority, redirectStatus)
 		}
 		normalized, err := normalizeDynamicURL(locationURL.String())
 		if err != nil {
-			return fail(dynamicObservationReasonInvalidLocation, dynamicCanonicalAuthority(req.URL))
+			return fail(dynamicObservationReasonInvalidLocation, targetKind, observationAuthority, redirectStatus)
 		}
 		authority := dynamicCanonicalAuthority(normalized)
 		if !t.dynamicPolicy.available {
-			return fail(dynamicObservationReasonRuntimeUnavailable, authority)
+			return fail(dynamicObservationReasonRuntimeUnavailable, targetKind, authority, redirectStatus)
 		}
 		key := normalized.String()
 		if _, seen := visited[key]; seen {
-			return fail(dynamicObservationReasonRedirectLoop, authority)
+			return fail(dynamicObservationReasonRedirectLoop, targetKind, authority, redirectStatus)
 		}
 		if redirectsFollowed >= t.dynamicPolicy.limits.MaxRedirects {
-			return fail(dynamicObservationReasonHopLimit, authority)
+			return fail(dynamicObservationReasonHopLimit, targetKind, authority, redirectStatus)
 		}
 		if reasonCode := t.dynamicPolicy.validateTarget(req.URL, normalized, selfTargets); reasonCode != "" {
-			return fail(reasonCode, authority)
+			return fail(reasonCode, targetKind, authority, redirectStatus)
 		}
 		reservation, reasonCode := t.dynamicState.reserveAuthority(authority, time.Now())
 		if reasonCode != "" {
-			return fail(reasonCode, authority)
+			return fail(reasonCode, targetKind, authority, redirectStatus)
 		}
 		pinnedIPs, reasonCode := reservation.resolve(req.Context(), normalized, selfTargets)
 		if reasonCode != "" {
 			reservation.rollback()
-			return fail(reasonCode, authority)
+			return fail(reasonCode, targetKind, authority, redirectStatus)
 		}
 		transport, err := t.newDynamicTransport(normalized, pinnedIPs, selfTargets)
 		if err != nil {
 			reservation.rollback()
 			if errors.Is(err, errDynamicSelfTarget) {
-				return fail(dynamicObservationReasonSelfTarget, authority)
+				return fail(dynamicObservationReasonSelfTarget, targetKind, authority, redirectStatus)
 			}
-			return fail(dynamicObservationReasonAddressDenied, authority)
+			return fail(dynamicObservationReasonAddressDenied, targetKind, authority, redirectStatus)
 		}
 		if !streamLeaseHeld {
 			var acquired bool
@@ -9220,17 +9632,17 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			if !acquired {
 				transport.CloseIdleConnections()
 				reservation.rollback()
-				return fail(dynamicObservationReasonCapacityLimit, authority)
+				return fail(dynamicObservationReasonCapacityLimit, targetKind, authority, redirectStatus)
 			}
 			streamLeaseHeld = true
 		}
 
 		// #nosec G704 -- target is normalized, policy-checked, DNS-pinned, and sent through a dedicated proxy-free transport.
-		newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(isolateDynamicOutboundContext(req.Context()), req, resp.StatusCode, normalized)
+		newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(isolateDynamicOutboundContext(req.Context()), req, redirectStatus, normalized)
 		if reasonCode != "" {
 			transport.CloseIdleConnections()
 			reservation.rollback()
-			return fail(reasonCode, authority)
+			return fail(reasonCode, targetKind, authority, redirectStatus)
 		}
 		newReq.Close = true
 		if newReq.Body != nil {
@@ -9250,16 +9662,16 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			}
 			transport.CloseIdleConnections()
 			reservation.rollback()
-			return fail(dynamicTransportFailureReason(roundTripErr), authority)
+			return fail(dynamicTransportFailureReason(roundTripErr), targetKind, authority, redirectStatus)
 		}
 		if newResp == nil {
 			transport.CloseIdleConnections()
 			reservation.rollback()
-			return fail(dynamicObservationReasonResponseFailure, authority)
+			return fail(dynamicObservationReasonResponseFailure, targetKind, authority, redirectStatus)
 		}
 		newResp.Request = newReq
 		lease.add(reservation)
-		t.observe(dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, authority)
+		t.observe(targetKind, dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, authority, redirectStatus)
 		currentTransport = transport
 		resp = newResp
 		req = newReq
@@ -9272,16 +9684,34 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
+		eligible, _ := req.Context().Value(dynamicRequestEligibleContextKey{}).(bool)
+		if eligible || !t.disableManualRedirects && isManualRedirectEligibleRequest(req) {
+			targetKind, authority := t.redirectObservationTarget(req.URL, nil)
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicTransportFailureReason(err), authority, 0)
+		}
 		return nil, err
 	}
-	eligible, _ := req.Context().Value(dynamicRequestEligibleContextKey{}).(bool)
-	if !t.dynamicPolicy.configured {
-		if t.disableLegacyRedirects {
-			return resp, nil
-		}
-		return t.roundTripLegacy(req, resp)
+
+	manualEnabled := !t.disableManualRedirects
+	if manualEnabled && (!t.dynamicPolicy.configured || t.responseTargetsConfiguredPlayback(req, resp)) {
+		return t.roundTripManual(req, resp)
 	}
-	if !eligible || !t.dynamicPolicy.sourceEnabled(dynamicDiscoverySourceRedirect) {
+	if !t.dynamicPolicy.configured {
+		return resp, nil
+	}
+	eligible, _ := req.Context().Value(dynamicRequestEligibleContextKey{}).(bool)
+	if !eligible {
+		if resp != nil && resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+			targetKind, authority := t.redirectObservationTargetFromResponse(req, resp)
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicObservationReasonRequestUnclassified, authority, resp.StatusCode)
+		}
+		return resp, nil
+	}
+	if !t.dynamicPolicy.sourceEnabled(dynamicDiscoverySourceRedirect) {
+		if resp != nil && resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+			targetKind, authority := t.redirectObservationTargetFromResponse(req, resp)
+			t.observe(targetKind, dynamicObservationDecisionDenied, dynamicObservationReasonUnsupportedStatus, authority, resp.StatusCode)
+		}
 		return resp, nil
 	}
 	return t.roundTripDynamic(req, resp)
@@ -14419,7 +14849,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			base:                    baseTransport,
 			playbackHosts:           playbackHostsSet,
 			configuredAuthorities:   configuredAuthorities,
-			disableLegacyRedirects:  !isRedirectMode,
+			disableManualRedirects:  !isRedirectMode,
 			policy:                  policy,
 			upstreamHeaderPolicy:    configuredHeaders,
 			dynamicPolicy:           redirectPolicy,
@@ -16596,8 +17026,11 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			a.jsonOK(w, DynamicObservationsResponse{
-				Observations:        make([]DynamicObservation, 0),
-				DroppedObservations: a.db.DroppedDynamicObservations(),
+				Observations:              make([]DynamicObservation, 0),
+				DroppedObservationsGlobal: a.db.DroppedDynamicObservations(),
+				RetentionDays:             dynamicObservationRetentionDays,
+				PerSiteRowLimit:           dynamicObservationPerSiteRowLimit,
+				GlobalRowLimit:            dynamicObservationGlobalRowLimit,
 			})
 			return
 		}
@@ -16607,8 +17040,11 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.jsonOK(w, DynamicObservationsResponse{
-			Observations:        observations,
-			DroppedObservations: a.db.DroppedDynamicObservations(),
+			Observations:              observations,
+			DroppedObservationsGlobal: a.db.DroppedDynamicObservations(),
+			RetentionDays:             dynamicObservationRetentionDays,
+			PerSiteRowLimit:           dynamicObservationPerSiteRowLimit,
+			GlobalRowLimit:            dynamicObservationGlobalRowLimit,
 		})
 
 	case action == "toggle" && r.Method == "POST":
@@ -17204,7 +17640,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.9.0"
+var appVersion = "v1.9.1"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {

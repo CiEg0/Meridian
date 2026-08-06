@@ -284,7 +284,7 @@ func TestDynamicRedirectRuntimePreservesDisabledAndManualRedirects(t *testing.T)
 		}
 		resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodGet, "https://origin.example.com/Videos/42/stream", nil))
 		if err != nil {
-			t.Fatalf("legacy RoundTrip: %v", err)
+			t.Fatalf("manual RoundTrip: %v", err)
 		}
 		defer resp.Body.Close()
 		if calls != 2 || factoryCalls != 0 || resp.StatusCode != http.StatusOK {
@@ -304,7 +304,7 @@ func TestDynamicRedirectRuntimePreservesDisabledAndManualRedirects(t *testing.T)
 		}
 		resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodGet, "https://origin.example.com/Videos/42/stream", nil))
 		if err != nil {
-			t.Fatalf("legacy unknown RoundTrip: %v", err)
+			t.Fatalf("manual unknown RoundTrip: %v", err)
 		}
 		if calls != 1 || resp.StatusCode != http.StatusFound || body.closed.Load() {
 			t.Fatalf("calls=%d status=%d closed=%t, want untouched redirect", calls, resp.StatusCode, body.closed.Load())
@@ -342,45 +342,95 @@ func TestDynamicRedirectRuntimePreservesDisabledAndManualRedirects(t *testing.T)
 		}
 	})
 
-	t.Run("configured dynamic policy leaves ineligible API redirect untouched", func(t *testing.T) {
+	t.Run("manual authority bypasses dynamic path classification", func(t *testing.T) {
+		db, _ := openDynamicObservationTestDB(t)
+		site := createDynamicObservationTestSite(t, db, "manual-unclassified-path")
 		calls := 0
 		transport := &redirectFollowTransport{
 			base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				calls++
-				return redirectRuntimeResponse(req, http.StatusMovedPermanently, []string{manualTarget}, nil), nil
+				if calls == 1 {
+					return redirectRuntimeResponse(req, http.StatusMovedPermanently, []string{manualTarget}, nil), nil
+				}
+				return redirectRuntimeResponse(req, http.StatusOK, nil, io.NopCloser(strings.NewReader("manual"))), nil
 			}),
-			playbackHosts: map[string]bool{manualAuthority: true},
-			dynamicPolicy: redirectRuntimePolicy(dynamicProfileSafe, true),
+			playbackHosts:         map[string]bool{manualAuthority: true},
+			configuredAuthorities: map[string]bool{manualAuthority: true},
+			dynamicPolicy:         redirectRuntimePolicy(dynamicProfileSafe, true),
+			database:              db,
+			siteID:                site.ID,
 		}
 		resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodGet, "https://origin.example.com/Users/42", nil))
 		if err != nil {
-			t.Fatalf("ineligible RoundTrip: %v", err)
+			t.Fatalf("manual unclassified-path RoundTrip: %v", err)
 		}
 		defer resp.Body.Close()
-		if calls != 1 || resp.StatusCode != http.StatusMovedPermanently {
-			t.Fatalf("calls=%d status=%d, want untouched 1/301", calls, resp.StatusCode)
+		if calls != 2 || resp.StatusCode != http.StatusOK {
+			t.Fatalf("calls=%d status=%d, want followed 2/200", calls, resp.StatusCode)
+		}
+		observations, err := db.ListDynamicObservations(site.ID)
+		if err != nil {
+			t.Fatalf("list manual unclassified-path observation: %v", err)
+		}
+		if len(observations) != 1 {
+			t.Fatalf("manual unclassified-path observations=%#v", observations)
+		}
+		observation := observations[0]
+		if observation.TargetKind != dynamicObservationTargetConfigured || observation.Stage != dynamicObservationStageResponse || observation.Decision != dynamicObservationDecisionAllowed || observation.ReasonCode != dynamicObservationReasonRedirectAllowed || observation.RedirectStatus != http.StatusMovedPermanently || observation.Count != 1 {
+			t.Fatalf("manual unclassified-path observation=%#v", observation)
 		}
 	})
 
-	t.Run("configured dynamic policy leaves source-disabled redirect untouched", func(t *testing.T) {
+	t.Run("initial upstream failure is same-authority", func(t *testing.T) {
+		db, _ := openDynamicObservationTestDB(t)
+		site := createDynamicObservationTestSite(t, db, "initial-same-authority-failure")
+		transport := &redirectFollowTransport{
+			base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("origin unavailable")
+			}),
+			dynamicPolicy: redirectRuntimePolicy(dynamicProfileSafe, true),
+			database:      db,
+			siteID:        site.ID,
+		}
+		resp, err := transport.RoundTrip(redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.com/Videos/42/stream"))
+		if err == nil || resp != nil {
+			t.Fatalf("initial failure response=%#v err=%v", resp, err)
+		}
+		observations, listErr := db.ListDynamicObservations(site.ID)
+		if listErr != nil {
+			t.Fatalf("list initial failure observation: %v", listErr)
+		}
+		if len(observations) != 1 {
+			t.Fatalf("initial failure observations=%#v", observations)
+		}
+		observation := observations[0]
+		if observation.TargetKind != dynamicObservationTargetSameAuthority || observation.CanonicalAuthority != "https://origin.example.com:443" || observation.Decision != dynamicObservationDecisionDenied || observation.ReasonCode != dynamicObservationReasonResponseFailure || observation.RedirectStatus != 0 {
+			t.Fatalf("initial failure observation=%#v", observation)
+		}
+	})
+
+	t.Run("manual authority bypasses disabled dynamic redirect source", func(t *testing.T) {
 		calls := 0
 		policy := redirectRuntimePolicy(dynamicProfileSafe, true)
 		policy.sources = []string{dynamicDiscoverySourceHLS}
 		transport := &redirectFollowTransport{
 			base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				calls++
-				return redirectRuntimeResponse(req, http.StatusFound, []string{manualTarget}, nil), nil
+				if calls == 1 {
+					return redirectRuntimeResponse(req, http.StatusFound, []string{manualTarget}, nil), nil
+				}
+				return redirectRuntimeResponse(req, http.StatusOK, nil, io.NopCloser(strings.NewReader("manual"))), nil
 			}),
 			playbackHosts: map[string]bool{manualAuthority: true},
 			dynamicPolicy: policy,
 		}
 		resp, err := transport.RoundTrip(redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.com/Videos/42/stream"))
 		if err != nil {
-			t.Fatalf("source-disabled RoundTrip: %v", err)
+			t.Fatalf("source-disabled manual RoundTrip: %v", err)
 		}
 		defer resp.Body.Close()
-		if calls != 1 || resp.StatusCode != http.StatusFound {
-			t.Fatalf("calls=%d status=%d, want untouched 1/302", calls, resp.StatusCode)
+		if calls != 2 || resp.StatusCode != http.StatusOK {
+			t.Fatalf("calls=%d status=%d, want followed 2/200", calls, resp.StatusCode)
 		}
 	})
 
@@ -406,6 +456,187 @@ func TestDynamicRedirectRuntimePreservesDisabledAndManualRedirects(t *testing.T)
 			t.Fatalf("source-disabled direct follower response=%#v err=%v bodyClosed=%t resolverCalls=%d", got, err, body.closed.Load(), resolverCalls.Load())
 		}
 	})
+}
+
+func TestManualRedirectPolicyIsIndependentAndBounded(t *testing.T) {
+	manualTarget := "https://media.example.com/custom/manual/path"
+	manualURL := redirectRuntimeMustParseURL(t, manualTarget)
+	manualAuthority := redirectHostKey(manualURL)
+
+	for _, status := range []int{
+		http.StatusMovedPermanently,
+		http.StatusFound,
+		http.StatusSeeOther,
+		http.StatusTemporaryRedirect,
+		http.StatusPermanentRedirect,
+	} {
+		t.Run(fmt.Sprintf("GET follows %d outside dynamic classification", status), func(t *testing.T) {
+			calls := 0
+			var followedMethod string
+			transport := &redirectFollowTransport{
+				base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls++
+					if calls == 1 {
+						return redirectRuntimeResponse(req, status, []string{manualTarget}, nil), nil
+					}
+					followedMethod = req.Method
+					return redirectRuntimeResponse(req, http.StatusOK, nil, io.NopCloser(strings.NewReader("manual"))), nil
+				}),
+				playbackHosts: map[string]bool{manualAuthority: true},
+				dynamicPolicy: redirectRuntimePolicy(dynamicProfileSafe, true),
+			}
+			resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodGet, "https://origin.example.com/Users/42", nil))
+			if err != nil {
+				t.Fatalf("manual status %d: %v", status, err)
+			}
+			defer resp.Body.Close()
+			if calls != 2 || resp.StatusCode != http.StatusOK || followedMethod != http.MethodGet {
+				t.Fatalf("status=%d calls=%d final=%d method=%q", status, calls, resp.StatusCode, followedMethod)
+			}
+		})
+	}
+
+	t.Run("303 preserves HEAD", func(t *testing.T) {
+		calls := 0
+		var followedMethod string
+		transport := &redirectFollowTransport{
+			base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					return redirectRuntimeResponse(req, http.StatusSeeOther, []string{manualTarget}, nil), nil
+				}
+				followedMethod = req.Method
+				return redirectRuntimeResponse(req, http.StatusOK, nil, http.NoBody), nil
+			}),
+			playbackHosts: map[string]bool{manualAuthority: true},
+			dynamicPolicy: redirectRuntimePolicy(dynamicProfileCompatible, true),
+		}
+		resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodHead, "https://origin.example.com/Users/42", nil))
+		if err != nil {
+			t.Fatalf("manual HEAD 303: %v", err)
+		}
+		defer resp.Body.Close()
+		if calls != 2 || followedMethod != http.MethodHead || resp.StatusCode != http.StatusOK {
+			t.Fatalf("calls=%d method=%q status=%d", calls, followedMethod, resp.StatusCode)
+		}
+	})
+
+	t.Run("allows five hops", func(t *testing.T) {
+		calls := 0
+		transport := &redirectFollowTransport{
+			base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if calls <= manualRedirectMaxHops {
+					return redirectRuntimeResponse(req, http.StatusFound, []string{fmt.Sprintf("https://media.example.com/hop-%d", calls)}, nil), nil
+				}
+				return redirectRuntimeResponse(req, http.StatusOK, nil, io.NopCloser(strings.NewReader("manual"))), nil
+			}),
+			playbackHosts: map[string]bool{manualAuthority: true},
+		}
+		resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodGet, "https://origin.example.com/custom", nil))
+		if err != nil {
+			t.Fatalf("five-hop manual redirect: %v", err)
+		}
+		defer resp.Body.Close()
+		if calls != manualRedirectMaxHops+1 || resp.StatusCode != http.StatusOK {
+			t.Fatalf("calls=%d status=%d, want %d/200", calls, resp.StatusCode, manualRedirectMaxHops+1)
+		}
+	})
+
+	t.Run("stops before sixth hop", func(t *testing.T) {
+		calls := 0
+		transport := &redirectFollowTransport{
+			base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				return redirectRuntimeResponse(req, http.StatusFound, []string{fmt.Sprintf("https://media.example.com/hop-%d", calls)}, nil), nil
+			}),
+			playbackHosts: map[string]bool{manualAuthority: true},
+		}
+		resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodGet, "https://origin.example.com/custom", nil))
+		if err != nil {
+			t.Fatalf("sixth-hop manual redirect: %v", err)
+		}
+		defer resp.Body.Close()
+		if calls != manualRedirectMaxHops+1 || resp.StatusCode != http.StatusFound {
+			t.Fatalf("calls=%d status=%d, want %d/302", calls, resp.StatusCode, manualRedirectMaxHops+1)
+		}
+	})
+
+	t.Run("stops configured loop", func(t *testing.T) {
+		calls := 0
+		loopTarget := "https://media.example.com/loop"
+		transport := &redirectFollowTransport{
+			base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				return redirectRuntimeResponse(req, http.StatusFound, []string{loopTarget}, nil), nil
+			}),
+			playbackHosts: map[string]bool{manualAuthority: true},
+		}
+		resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodGet, "https://origin.example.com/custom", nil))
+		if err != nil {
+			t.Fatalf("manual redirect loop: %v", err)
+		}
+		defer resp.Body.Close()
+		if calls != 2 || resp.StatusCode != http.StatusFound {
+			t.Fatalf("loop calls=%d status=%d, want 2/302", calls, resp.StatusCode)
+		}
+	})
+
+	t.Run("rejects fragment-bearing Location", func(t *testing.T) {
+		calls := 0
+		body := &redirectRuntimeCloseSpy{Reader: strings.NewReader("redirect")}
+		transport := &redirectFollowTransport{
+			base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				return redirectRuntimeResponse(req, http.StatusFound, []string{manualTarget + "#fragment"}, body), nil
+			}),
+			playbackHosts: map[string]bool{manualAuthority: true},
+			dynamicPolicy: redirectRuntimePolicy(dynamicProfileSafe, true),
+		}
+		resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodGet, "https://origin.example.com/custom", nil))
+		if err != nil {
+			t.Fatalf("fragment-bearing manual redirect: %v", err)
+		}
+		if calls != 1 || resp.StatusCode != http.StatusFound || body.closed.Load() {
+			t.Fatalf("fragment calls=%d status=%d closed=%t, want 1/302/false", calls, resp.StatusCode, body.closed.Load())
+		}
+		_ = resp.Body.Close()
+	})
+
+	for _, test := range []struct {
+		name    string
+		request *http.Request
+	}{
+		{name: "POST", request: httptest.NewRequest(http.MethodPost, "https://origin.example.com/custom", strings.NewReader("body"))},
+		{name: "Upgrade", request: func() *http.Request {
+			r := httptest.NewRequest(http.MethodGet, "https://origin.example.com/custom", nil)
+			r.Header.Set("Connection", "Upgrade")
+			r.Header.Set("Upgrade", "websocket")
+			return r
+		}()},
+		{name: "reserved capability", request: httptest.NewRequest(http.MethodGet, "https://origin.example.com"+dynamicRoutePrefix+"opaque", nil)},
+	} {
+		t.Run("does not follow "+test.name, func(t *testing.T) {
+			calls := 0
+			body := &redirectRuntimeCloseSpy{Reader: strings.NewReader("redirect")}
+			transport := &redirectFollowTransport{
+				base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls++
+					return redirectRuntimeResponse(req, http.StatusTemporaryRedirect, []string{manualTarget}, body), nil
+				}),
+				playbackHosts: map[string]bool{manualAuthority: true},
+				dynamicPolicy: redirectRuntimePolicy(dynamicProfileExtreme, true),
+			}
+			resp, err := transport.RoundTrip(test.request)
+			if err != nil {
+				t.Fatalf("manual %s: %v", test.name, err)
+			}
+			if calls != 1 || resp.StatusCode != http.StatusTemporaryRedirect || body.closed.Load() {
+				t.Fatalf("manual %s calls=%d status=%d closed=%t", test.name, calls, resp.StatusCode, body.closed.Load())
+			}
+			_ = resp.Body.Close()
+		})
+	}
 }
 
 func TestDynamicRedirectRuntimeFollowsAllAllowedUnknownStatuses(t *testing.T) {
@@ -810,30 +1041,18 @@ func TestDynamicRedirectRuntimePreparesRepeatableExtremeBody(t *testing.T) {
 	release()
 }
 
-func TestDynamicRedirectRuntimeExtremeCrossAuthorityBodyHeaders(t *testing.T) {
+func TestDynamicRedirectRuntimeExtremeDoesNotReplayConfiguredManualBody(t *testing.T) {
 	const payload = `{"operation":"probe"}`
 	target := redirectRuntimeMustParseURL(t, "https://cdn.example.com/jobs/42")
-	targetAuthority := redirectHostKey(target)
 	redirectBody := &redirectRuntimeCloseSpy{Reader: strings.NewReader("redirect")}
-	var followed *http.Request
-	var followedBody string
 	calls := 0
 	transport := &redirectFollowTransport{
 		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			calls++
-			if calls == 1 {
-				return redirectRuntimeResponse(req, http.StatusTemporaryRedirect, []string{target.String()}, redirectBody), nil
-			}
-			followed = req
-			body, err := io.ReadAll(req.Body)
-			if err != nil {
-				t.Fatalf("read cross-authority body: %v", err)
-			}
-			followedBody = string(body)
-			return redirectRuntimeResponse(req, http.StatusOK, nil, io.NopCloser(strings.NewReader("ok"))), nil
+			return redirectRuntimeResponse(req, http.StatusTemporaryRedirect, []string{target.String()}, redirectBody), nil
 		}),
-		playbackHosts:         map[string]bool{targetAuthority: true},
-		configuredAuthorities: map[string]bool{targetAuthority: true},
+		playbackHosts:         map[string]bool{redirectHostKey(target): true},
+		configuredAuthorities: map[string]bool{redirectHostKey(target): true},
 		dynamicPolicy:         redirectRuntimePolicy(dynamicProfileExtreme, true),
 	}
 	request := redirectRuntimeEligibleRequest(http.MethodPatch, "https://origin.example.com/jobs/42")
@@ -842,81 +1061,19 @@ func TestDynamicRedirectRuntimeExtremeCrossAuthorityBodyHeaders(t *testing.T) {
 	request.GetBody = func() (io.ReadCloser, error) {
 		return io.NopCloser(strings.NewReader(payload)), nil
 	}
-	wantHeaders := map[string]string{
-		"Accept":           "application/json",
-		"Accept-Encoding":  "identity",
-		"Range":            "bytes=0-4095",
-		"If-Range":         `"safe-etag"`,
-		"User-Agent":       "safe-client/1",
-		"Content-Type":     "application/json",
-		"Content-Encoding": "gzip",
-		"Content-Language": "en-US",
-		"Content-MD5":      "safe-content-md5",
-		"Digest":           "sha-256=safe-digest",
-	}
-	for name, value := range wantHeaders {
-		request.Header.Set(name, value)
-	}
-	for name, value := range map[string]string{
-		"Authorization":        "Bearer origin-secret",
-		"Cookie":               "session=origin-secret",
-		"Proxy-Authorization":  "Basic proxy-secret",
-		"X-Emby-Authorization": `MediaBrowser Client="client", Token="emby-secret"`,
-		"X-Emby-Token":         "emby-secret",
-		"X-MediaBrowser-Token": "media-secret",
-		"Forwarded":            "for=203.0.113.9;proto=https",
-		"X-Forwarded-For":      "203.0.113.9",
-		"X-Forwarded-Host":     "private.example.net",
-		"X-Forwarded-Proto":    "https",
-		"X-Real-IP":            "203.0.113.9",
-		"Connection":           "keep-alive, X-Hop-Secret",
-		"X-Hop-Secret":         "hop-secret",
-		"Keep-Alive":           "timeout=5",
-		"Proxy-Connection":     "keep-alive",
-		"TE":                   "trailers",
-		"Trailer":              "X-Trailer-Secret",
-		"Transfer-Encoding":    "chunked",
-		"Upgrade":              "websocket",
-		"Expect":               "100-continue",
-		"Content-Length":       "999999",
-		"X-Arbitrary-Secret":   "unknown-secret",
-	} {
-		request.Header.Set(name, value)
-	}
 
 	resp, err := transport.RoundTrip(request)
 	if err != nil {
-		t.Fatalf("cross-authority replay: %v", err)
+		t.Fatalf("configured manual Extreme request: %v", err)
 	}
-	if resp == nil || resp.StatusCode != http.StatusOK || calls != 2 || followed == nil {
-		t.Fatalf("response=%#v calls=%d followed_non_nil=%t", resp, calls, followed != nil)
+	if resp == nil || resp.StatusCode != http.StatusTemporaryRedirect || calls != 1 {
+		t.Fatalf("response=%#v calls=%d, want untouched 307 after one call", resp, calls)
+	}
+	if redirectBody.closed.Load() {
+		t.Fatal("manual redirect response body closed even though the redirect was returned to the client")
 	}
 	_ = resp.Body.Close()
 	_ = request.Body.Close()
-	if !redirectBody.closed.Load() {
-		t.Fatal("cross-authority redirect body was not closed")
-	}
-	if followed.Method != http.MethodPatch || followedBody != payload || followed.ContentLength != int64(len(payload)) || followed.GetBody == nil {
-		t.Fatalf("followed method=%q body=%q length=%d GetBody=%t", followed.Method, followedBody, followed.ContentLength, followed.GetBody != nil)
-	}
-	for name, want := range wantHeaders {
-		if got := followed.Header.Get(name); got != want {
-			t.Errorf("safe replay header %s=%q, want %q", name, got, want)
-		}
-	}
-	for _, name := range []string{
-		"Authorization", "Cookie", "Proxy-Authorization", "X-Emby-Authorization", "X-Emby-Token", "X-MediaBrowser-Token",
-		"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP",
-		"Connection", "X-Hop-Secret", "Keep-Alive", "Proxy-Connection", "TE", "Trailer", "Transfer-Encoding", "Upgrade", "Expect",
-		"Content-Length", "X-Arbitrary-Secret",
-	} {
-		if values := followed.Header.Values(name); len(values) != 0 {
-			t.Errorf("cross-authority replay leaked %s=%q", name, values)
-		}
-	}
-	if len(followed.Header) != len(wantHeaders) {
-		t.Errorf("cross-authority replay headers=%v, want only %v", followed.Header, wantHeaders)
-	}
 }
 
 func TestDynamicRedirectRuntimeReusesCallerStreamLease(t *testing.T) {

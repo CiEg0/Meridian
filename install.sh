@@ -32,6 +32,7 @@ DOMAIN_MODE="ask"
 REQUESTED_DOMAIN=""
 CERTBOT_EMAIL=""
 INITIAL_SETUP_TOKEN=""
+SETUP_TOKEN_ORIGIN=""
 LAST_BACKUP_PATH=""
 ROOT_PREFIX=()
 UPDATE_TMP_DIR=""
@@ -604,7 +605,10 @@ ensure_setup_token() {
     local tmp_dir="$1" env_file tmp_file existing_token
     env_file=$(env_file_path) || return 1
     existing_token=$(read_env_value SETUP_TOKEN) || return 1
-    [ -z "$existing_token" ] || return 0
+    if [ -n "$existing_token" ]; then
+        SETUP_TOKEN_ORIGIN="existing"
+        return 0
+    fi
     INITIAL_SETUP_TOKEN=$(generate_secret) || return 1
     tmp_file="${tmp_dir}/env-setup-token"
     # $1 is an awk field reference, not a shell variable.
@@ -613,6 +617,7 @@ ensure_setup_token() {
     printf 'SETUP_TOKEN=%s\n' "$INITIAL_SETUP_TOKEN" >> "$tmp_file" || return 1
     chmod 0600 "$tmp_file" || return 1
     install_env_file "$tmp_file" || return 1
+    SETUP_TOKEN_ORIGIN="generated"
 }
 
 ensure_upstream_header_key() {
@@ -787,6 +792,7 @@ prepare_data_and_config() {
             "$secret" "$upstream_header_key" "$dynamic_route_key" "$INITIAL_SETUP_TOKEN" "$DATA_DIR" > "$env_tmp" || return 1
         chmod 0600 "$env_tmp" || return 1
         install_env_file "$env_tmp" || return 1
+        SETUP_TOKEN_ORIGIN="generated"
         ok "已创建安全配置: $env_file"
     else
         ensure_dynamic_route_key "$tmp_dir" || return 1
@@ -1659,9 +1665,24 @@ apply_domain_choice() {
     esac
 }
 
+print_setup_token_notice() {
+    case "$SETUP_TOKEN_ORIGIN" in
+        generated)
+            [ -n "$INITIAL_SETUP_TOKEN" ] || return 1
+            printf "  ${YELLOW}初始化令牌（仅显示这一次，请立即保存）:${NC} ${BOLD}%s${NC}\n" "$INITIAL_SETUP_TOKEN"
+            ;;
+        existing)
+            printf "  ${YELLOW}若初始化仍待完成，root 可从 %s 恢复现有 SETUP_TOKEN；安装器不会自动显示现有令牌。${NC}\n" "$(env_file_path)"
+            ;;
+        "") ;;
+        *) return 1 ;;
+    esac
+}
+
 do_install() {
     local current_binary="${INSTALL_DIR}/${BIN_NAME}" tmp_dir version
     INITIAL_SETUP_TOKEN=""
+    SETUP_TOKEN_ORIGIN=""
     need_cmd curl
     need_cmd awk
     need_cmd grep
@@ -1682,9 +1703,7 @@ do_install() {
             return 1
         fi
         rm -rf -- "$tmp_dir"
-        if [ -n "$INITIAL_SETUP_TOKEN" ]; then
-            printf "  ${YELLOW}初始化令牌（仅在尚未创建管理员时需要，请立即保存）:${NC} ${BOLD}%s${NC}\n" "$INITIAL_SETUP_TOKEN"
-        fi
+        print_setup_token_notice || return 1
         apply_domain_choice 1
         return 0
     fi
@@ -1723,14 +1742,13 @@ do_install() {
         printf '  面板地址: http://服务器IP:%s\n' "$(read_config_port)"
     fi
     printf '  数据目录: %s\n' "$DATA_DIR"
-    if [ -n "$INITIAL_SETUP_TOKEN" ]; then
-        printf "  ${YELLOW}首次初始化令牌（请立即保存）:${NC} ${BOLD}%s${NC}\n" "$INITIAL_SETUP_TOKEN"
-    fi
+    print_setup_token_notice || return 1
 }
 
 do_update() {
     local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_version latest_version should_stop_after=0 tmp_dir
     INITIAL_SETUP_TOKEN=""
+    SETUP_TOKEN_ORIGIN=""
     UPDATE_SERVICE_SNAPSHOT=""
     UPDATE_SERVICE_CHANGED=0
     [ -x "$current_binary" ] || fail "Meridian 尚未安装，请先运行 install"
@@ -1844,9 +1862,7 @@ do_update() {
     trap - EXIT INT TERM
     ok "已更新到最新版本: $latest_version"
     info "现有 .env、面板域名和证书均已保留；安装器管理的 Nginx 配置已按需完成 URI 日志脱敏迁移"
-    if [ -n "$INITIAL_SETUP_TOKEN" ]; then
-        printf "  ${YELLOW}初始化令牌（仅在尚未创建管理员时需要，请立即保存）:${NC} ${BOLD}%s${NC}\n" "$INITIAL_SETUP_TOKEN"
-    fi
+    print_setup_token_notice || return 1
 }
 
 password_byte_length() {

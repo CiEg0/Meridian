@@ -232,6 +232,7 @@ class FakeDocument {
 
 function loadModalHarness(options = {}) {
   const document = new FakeDocument();
+  const timeSandbox = loadScripts('api.js');
   const state = {
     confirmationResult: false,
     confirmations: [],
@@ -253,6 +254,7 @@ function loadModalHarness(options = {}) {
       },
     },
     URL,
+    formatShanghaiDateTimeParts: timeSandbox.formatShanghaiDateTimeParts,
     API: {
       ingressCapabilities: async () => options.siteCapabilities || ({
         host_only_available: true,
@@ -269,20 +271,33 @@ function loadModalHarness(options = {}) {
         state.observationGets.push(siteId);
         return {
           observations: [{
+            site_id: 17,
             canonical_authority: 'https://media.example:443',
             source: 'redirect',
+            target_kind: 'discovered',
+            stage: 'location',
             decision: 'allowed',
             reason_code: 'redirect_allowed',
+            redirect_status: 302,
             first_seen_ms: 0,
             last_seen_ms: 1,
             count: 2,
           }],
-          dropped_observations: 3,
+          dropped_observations_global: 3,
+          retention_days: 30,
+          per_site_row_limit: 500,
+          global_row_limit: 10000,
         };
       },
       deleteDynamicObservations: async siteId => {
         state.observationDeletes.push(siteId);
-        return { observations: [], dropped_observations: 0 };
+        return {
+          observations: [],
+          dropped_observations_global: 0,
+          retention_days: 30,
+          per_site_row_limit: 500,
+          global_row_limit: 10000,
+        };
       },
     },
     Toast: {
@@ -692,18 +707,43 @@ test('create keeps discovery disabled when the structured catalog is unavailable
   assert.deepEqual(state.errors, []);
 });
 
-test('observation normalization accepts only finite enums and privacy-safe aggregate fields', () => {
+test('shared Shanghai formatter is exact and rejects invalid timestamps', () => {
+  const sandbox = loadScripts('api.js');
+  assert.deepEqual(plain(sandbox.formatShanghaiDateTimeParts('2026-08-06T13:04:31.215Z')), {
+    date: '2026-08-06',
+    time: '21:04',
+  });
+  assert.equal(sandbox.formatShanghaiDateTime('2026-08-06T13:04:31.215Z'), '2026-08-06 21:04');
+  assert.equal(sandbox.formatShanghaiDateTimeParts('not-a-timestamp'), null);
+  assert.equal(sandbox.formatShanghaiDateTimeParts(null), null);
+});
+
+test('observation normalization accepts only the exact bounded privacy-safe contract', () => {
   const sandbox = loadScripts('api.js', 'pages/sites.js');
+  assert.deepEqual(JSON.parse(vm.runInContext(
+    'JSON.stringify(DYNAMIC_OBSERVATION_STAGE_IDS.map(id => [id, DYNAMIC_OBSERVATION_STAGE_LABELS[id]]))',
+    sandbox,
+  )), [
+    ['response', '响应处理'], ['location', 'Location 读取'], ['policy', '安全策略'],
+    ['resolve', 'DNS 解析'], ['connect', '建立连接'], ['capacity', '容量控制'],
+    ['parse', '内容解析'], ['capability', '能力链接'], ['runtime', '运行时'],
+  ]);
+  const observedAt = Date.parse('2026-08-06T13:04:31.215Z');
   const finiteReasonRows = EXTREME_OBSERVATION_REASON_CASES.map(({ source, reason }, index) => ({
+    site_id: 17,
     canonical_authority: `https://reason-${index}.example:443`,
     source,
+    target_kind: 'discovered',
+    stage: 'policy',
     decision: 'denied',
     reason_code: reason,
-    first_seen_ms: 10 + (index * 2),
-    last_seen_ms: 11 + (index * 2),
+    redirect_status: 0,
+    first_seen_ms: observedAt,
+    last_seen_ms: observedAt,
     count: index + 1,
   }));
   const sensitiveValues = [
+    ATTACK,
     'unknown_reason_token_secret',
     'https://media.example:443/private/video.m3u8?access_token=normalization-secret',
     '/private/video.m3u8',
@@ -714,87 +754,95 @@ test('observation normalization accepts only finite enums and privacy-safe aggre
   const normalized = sandbox.normalizeDynamicObservationsResponse({
     observations: [
       {
+        site_id: 17,
         canonical_authority: 'HTTPS://Media.Example.COM:443',
         source: 'redirect',
+        target_kind: 'discovered',
+        stage: 'location',
         decision: 'allowed',
         reason_code: 'redirect_allowed',
-        first_seen_ms: 0,
-        last_seen_ms: 1700000000123,
+        redirect_status: 302,
+        first_seen_ms: observedAt,
+        last_seen_ms: observedAt + 60000,
         count: 3,
       },
       {
-        canonical_authority: 'http://[2001:DB8::1]:8080',
-        source: 'redirect',
-        decision: 'denied',
-        reason_code: 'scheme_denied',
-        first_seen_ms: 1,
-        last_seen_ms: 2,
-        count: Number.MAX_SAFE_INTEGER,
+        site_id: ATTACK,
+        canonical_authority: sensitiveValues[2],
+        source: ATTACK,
+        target_kind: ATTACK,
+        stage: ATTACK,
+        decision: ATTACK,
+        reason_code: sensitiveValues[1],
+        redirect_status: 418,
+        first_seen_ms: '2026-08-06T13:04:31.215Z',
+        last_seen_ms: -1,
+        count: '3',
+        full_url: sensitiveValues[2],
+        path: sensitiveValues[3],
+        query: sensitiveValues[4],
+        request_headers: { Authorization: sensitiveValues[5] },
+        response_body: sensitiveValues[6],
       },
       ...finiteReasonRows,
-      {
-        canonical_authority: 'https://unknown.example:443',
-        source: 'playback_info',
-        decision: 'denied',
-        reason_code: sensitiveValues[0],
-        first_seen_ms: 30,
-        last_seen_ms: 31,
-        count: 1,
-        full_url: sensitiveValues[1],
-        path: sensitiveValues[2],
-        query: sensitiveValues[3],
-        request_headers: { Authorization: sensitiveValues[4] },
-        response_body: sensitiveValues[5],
-      },
     ],
-    dropped_observations: 4,
+    dropped_observations_global: 4,
+    retention_days: 30,
+    per_site_row_limit: 500,
+    global_row_limit: 10000,
   });
 
-  assert.deepEqual(plain(normalized.observations.slice(0, 2)), [
-    {
-      authority: 'https://media.example.com:443',
-      source: 'redirect',
-      decision: 'allowed',
-      reason: 'redirect_allowed',
-      firstSeen: '1970-01-01T00:00:00.000Z',
-      lastSeen: '2023-11-14T22:13:20.123Z',
-      count: 3,
-    },
-    {
-      authority: 'http://[2001:db8::1]:8080',
-      source: 'redirect',
-      decision: 'denied',
-      reason: 'scheme_denied',
-      firstSeen: '1970-01-01T00:00:00.001Z',
-      lastSeen: '1970-01-01T00:00:00.002Z',
-      count: Number.MAX_SAFE_INTEGER,
-    },
-  ]);
+  assert.deepEqual(plain(normalized.observations[0]), {
+    authority: 'https://media.example.com:443',
+    source: 'redirect',
+    targetKind: 'discovered',
+    stage: 'location',
+    decision: 'allowed',
+    reason: 'redirect_allowed',
+    redirectStatus: 302,
+    firstSeen: { date: '2026-08-06', time: '21:04' },
+    lastSeen: { date: '2026-08-06', time: '21:05' },
+    count: 3,
+  });
+  assert.deepEqual(plain(normalized.observations[1]), {
+    authority: '—',
+    source: '',
+    targetKind: '',
+    stage: '',
+    decision: '',
+    reason: '',
+    redirectStatus: null,
+    firstSeen: null,
+    lastSeen: null,
+    count: null,
+  });
   assert.deepEqual(
-    plain(normalized.observations.slice(2, 2 + EXTREME_OBSERVATION_REASON_CASES.length)),
-    EXTREME_OBSERVATION_REASON_CASES.map(({ source, reason }, index) => ({
-      authority: `https://reason-${index}.example:443`,
-      source,
-      decision: 'denied',
-      reason,
-      firstSeen: new Date(10 + (index * 2)).toISOString(),
-      lastSeen: new Date(11 + (index * 2)).toISOString(),
-      count: index + 1,
-    })),
+    plain(normalized.observations.slice(2).map(item => item.reason)),
+    EXTREME_OBSERVATION_REASON_CASES.map(item => item.reason),
   );
-  assert.deepEqual(plain(normalized.observations[normalized.observations.length - 1]), {
-    authority: 'https://unknown.example:443',
-    source: 'playback_info',
-    decision: 'denied',
-    reason: '—',
-    firstSeen: '1970-01-01T00:00:00.030Z',
-    lastSeen: '1970-01-01T00:00:00.031Z',
-    count: 1,
-  });
-  assert.equal(normalized.dropped, 4);
-  const normalizedJSON = JSON.stringify(normalized);
-  for (const value of sensitiveValues) assert.ok(!normalizedJSON.includes(value));
+  assert.deepEqual({
+    dropped: normalized.droppedObservationsGlobal,
+    retention: normalized.retentionDays,
+    perSite: normalized.perSiteRowLimit,
+    global: normalized.globalRowLimit,
+  }, { dropped: 4, retention: 30, perSite: 500, global: 10000 });
 
+  const invalidMetadata = sandbox.normalizeDynamicObservationsResponse({
+    dropped_observations_global: ATTACK,
+    retention_days: 0,
+    per_site_row_limit: -1,
+    global_row_limit: '10000',
+    dropped_observations: 999,
+  });
+  assert.deepEqual({
+    dropped: invalidMetadata.droppedObservationsGlobal,
+    retention: invalidMetadata.retentionDays,
+    perSite: invalidMetadata.perSiteRowLimit,
+    global: invalidMetadata.globalRowLimit,
+  }, { dropped: null, retention: null, perSite: null, global: null });
+
+  const normalizedJSON = JSON.stringify(normalized) + JSON.stringify(invalidMetadata);
+  for (const value of sensitiveValues) assert.ok(!normalizedJSON.includes(value));
   for (const authority of [
     'https://media.example',
     'https://media.example:443/path',
@@ -803,13 +851,22 @@ test('observation normalization accepts only finite enums and privacy-safe aggre
     'ftp://media.example:21',
     'https://bad_host.example:443',
     'https://media.example:65536',
-  ]) {
-    assert.equal(sandbox.privacySafeObservationAuthority(authority), '—');
-  }
-  assert.equal(sandbox.normalizeDynamicObservationsResponse({ dropped_observations: -1 }).dropped, '—');
+  ]) assert.equal(sandbox.privacySafeObservationAuthority(authority), '—');
+
+  const bounded = sandbox.normalizeDynamicObservationsResponse({
+    observations: Array.from({ length: 501 }, (_, index) => ({
+      canonical_authority: `https://row-${index}.example:443`,
+      source: 'redirect', target_kind: 'discovered', stage: 'response', decision: 'allowed',
+      reason_code: 'redirect_allowed', redirect_status: 302,
+      first_seen_ms: observedAt, last_seen_ms: observedAt - index, count: 1,
+    })),
+  });
+  assert.equal(bounded.observations.length, 500);
+  assert.equal(bounded.observations[0].authority, 'https://row-0.example:443');
+  assert.equal(bounded.observations[499].authority, 'https://row-499.example:443');
 });
 
-test('dynamic rendering escapes values and never renders sensitive observation detail', () => {
+test('observation rendering localizes finite values, escapes codes, filters without reordering, and hides secrets', () => {
   const sandbox = loadScripts('api.js', 'pages/sites.js');
   const capabilities = structuredDiscoveryResponse({
     profiles: [
@@ -818,79 +875,86 @@ test('dynamic rendering escapes values and never renders sensitive observation d
       discoveryProfile('extreme'),
     ],
   });
-  const options = sandbox.renderDynamicProfileOptions(capabilities, 'safe');
-  const ruleRows = sandbox.renderDynamicRuleRows([{ type: 'exact', value: ATTACK }]);
-
-  for (const html of [options, ruleRows]) {
-    assert.ok(!html.includes(ATTACK));
-    assert.match(html, /&quot;&gt;&lt;img src=x onerror=alert\(1\)&gt;/);
+  for (const escapedHTML of [
+    sandbox.renderDynamicProfileOptions(capabilities, 'safe'),
+    sandbox.renderDynamicRuleRows([{ type: 'exact', value: ATTACK }]),
+  ]) {
+    assert.ok(!escapedHTML.includes(ATTACK));
+    assert.match(escapedHTML, /&quot;&gt;&lt;img src=x onerror=alert\(1\)&gt;/);
   }
-
-  const sensitiveValues = [
-    'https://media.example:443/private/video.m3u8?access_token=top-secret',
-    '/private/video.m3u8',
-    'access_token=top-secret',
-    'Bearer header-secret',
-    'body-secret-value',
-    'unknown_reason_token_secret',
-  ];
-  const finiteReasonRows = EXTREME_OBSERVATION_REASON_CASES.map(({ source, reason }, index) => ({
-    canonical_authority: `https://render-reason-${index}.example:443`,
-    source,
-    decision: 'denied',
-    reason_code: reason,
-    first_seen_ms: 10 + (index * 2),
-    last_seen_ms: 11 + (index * 2),
-    count: index + 1,
-  }));
-  const observations = sandbox.renderDynamicObservations({
+  const observedAt = Date.parse('2026-08-06T13:04:31.215Z');
+  const sensitiveValues = [ATTACK, 'access_token=top-secret', 'Bearer header-secret', 'body-secret-value'];
+  const payload = {
     observations: [
       {
-        canonical_authority: 'https://media.example:443',
-        source: 'redirect',
-        decision: 'allowed',
-        reason_code: 'redirect_allowed',
-        first_seen_ms: 0,
-        last_seen_ms: 1,
-        count: 2,
-        full_url: sensitiveValues[0],
-        path: sensitiveValues[1],
-        query: sensitiveValues[2],
-        token: 'top-secret',
-        request_headers: { Authorization: sensitiveValues[3] },
-        response_body: sensitiveValues[4],
+        canonical_authority: 'https://latest.example:443', source: 'redirect', target_kind: 'discovered',
+        stage: 'location', decision: 'allowed', reason_code: 'redirect_allowed', redirect_status: 302,
+        first_seen_ms: observedAt, last_seen_ms: observedAt, count: 2,
+        query: sensitiveValues[1], request_headers: { Authorization: sensitiveValues[2] }, response_body: sensitiveValues[3],
       },
-      ...finiteReasonRows,
       {
-        canonical_authority: 'https://unknown.example:443',
-        source: 'playback_info',
-        decision: 'denied',
-        reason_code: sensitiveValues[5],
-        first_seen_ms: 30,
-        last_seen_ms: 31,
-        count: 1,
-        full_url: sensitiveValues[0],
-        path: sensitiveValues[1],
-        query: sensitiveValues[2],
-        token: 'top-secret',
-        request_headers: { Authorization: sensitiveValues[3] },
-        response_body: sensitiveValues[4],
+        canonical_authority: 'https://configured.example:443', source: 'playback_info', target_kind: 'configured',
+        stage: 'policy', decision: 'denied', reason_code: 'scheme_denied', redirect_status: 0,
+        first_seen_ms: observedAt - 60000, last_seen_ms: observedAt - 60000, count: 1,
+      },
+      {
+        canonical_authority: `https://bad.example:443/?${ATTACK}`, source: ATTACK, target_kind: ATTACK,
+        stage: ATTACK, decision: ATTACK, reason_code: ATTACK, redirect_status: ATTACK,
+        first_seen_ms: ATTACK, last_seen_ms: ATTACK, count: ATTACK,
       },
     ],
-    dropped_observations: 7,
+    dropped_observations_global: 7,
+    retention_days: 30,
+    per_site_row_limit: 500,
+    global_row_limit: 10000,
+  };
+  const normalized = sandbox.normalizeDynamicObservationsResponse(payload);
+  assert.deepEqual(
+    plain(sandbox.filterDynamicObservations(normalized.observations, { decision: 'denied' }).map(row => row.authority)),
+    ['https://configured.example:443'],
+  );
+  assert.deepEqual(
+    plain(sandbox.filterDynamicObservations(normalized.observations, { source: 'redirect', targetKind: 'discovered' }).map(row => row.authority)),
+    ['https://latest.example:443'],
+  );
+  assert.deepEqual(
+    plain(sandbox.filterDynamicObservations(normalized.observations, { decision: ATTACK }).map(row => row.authority)),
+    normalized.observations.map(row => row.authority),
+  );
+
+  const html = sandbox.renderDynamicObservations(payload);
+  for (const phrase of [
+    '自动发现目标', '已配置目标', 'HTTP 30x 重定向', 'PlaybackInfo 响应', '通过', '拒绝',
+    'Location 读取', '安全策略', '重定向目标通过验证', 'redirect_allowed', 'HTTP 302', '非重定向',
+    '保留时间</strong>30 天', '单站点上限</strong>500 条', '全局存储上限</strong>10000 条',
+    '进程全局队列丢失计数</strong>7 条', '不可用',
+  ]) assert.ok(html.includes(phrase), phrase);
+  assert.match(html, /<time class="dynamic-observation-time"[^>]*><span>2026-08-06<\/span><span>21:04<\/span><\/time>/);
+  assert.ok(!html.includes('2026-08-06T13:04:31.215Z'));
+  const unavailableMetadataHTML = sandbox.renderDynamicObservations({
+    observations: [],
+    dropped_observations_global: ATTACK,
+    retention_days: ATTACK,
+    per_site_row_limit: ATTACK,
+    global_row_limit: ATTACK,
   });
+  for (const label of ['保留时间', '单站点上限', '全局存储上限', '进程全局队列丢失计数']) {
+    assert.ok(unavailableMetadataHTML.includes(`<strong>${label}</strong>不可用`));
+  }
+  assert.ok(!unavailableMetadataHTML.includes(ATTACK));
+  for (const value of sensitiveValues) assert.ok(!html.includes(value));
 
-  assert.match(observations, /https:\/\/media\.example:443/);
-  assert.match(observations, /https:\/\/unknown\.example:443/);
-  assert.match(observations, /已丢弃观察记录：7/);
-  for (const { reason } of EXTREME_OBSERVATION_REASON_CASES) assert.ok(observations.includes(reason));
-  for (const value of sensitiveValues) assert.ok(!observations.includes(value));
-  assert.ok(!observations.includes('top-secret'));
-  assert.ok(!observations.includes('header-secret'));
-  assert.ok(!observations.includes('body-secret-value'));
+  sandbox.attack = ATTACK;
+  vm.runInContext('DYNAMIC_OBSERVATION_REASON_CODES.add(attack); DYNAMIC_OBSERVATION_REASON_LABELS[attack] = "测试原因";', sandbox);
+  const escapedReason = sandbox.renderDynamicObservationReason(ATTACK);
+  assert.ok(!escapedReason.includes(ATTACK));
+  assert.match(escapedReason, /&quot;&gt;&lt;img src=x onerror=alert\(1\)&gt;/);
 
+  const configuredOnly = sandbox.renderDynamicObservations(payload, { targetKind: 'configured' });
+  assert.ok(configuredOnly.includes('https://configured.example:443'));
+  assert.ok(!configuredOnly.includes('https://latest.example:443'));
   const panel = sandbox.renderDynamicObservationsPanel(true);
-  for (const phrase of ['规范化权威', '有限原因代码', '聚合时间/次数', '完整 URL', '路径', '查询参数', '令牌', '请求头', '正文']) {
+  for (const phrase of ['播放路由观察记录', '路由与安全校验通过', '不代表播放成功', '完整 URL', '路径', '查询参数', '令牌', '请求头', '正文']) {
     assert.match(panel, new RegExp(phrase));
   }
 });
@@ -926,7 +990,16 @@ test('edit modal refreshes observations and confirms before clearing them', asyn
   assert.equal(state.opened, 1);
   assert.deepEqual(state.observationGets, [17], 'opening an edit modal must perform the initial refresh');
   assert.match(observations.innerHTML, /https:\/\/media\.example:443/);
-  assert.match(observations.innerHTML, /已丢弃观察记录：3/);
+  assert.match(observations.innerHTML, /进程全局队列丢失计数<\/strong>3 条/);
+  let targetKindFilter = document.getElementById('m-dynamic-observation-target-kind-filter');
+  targetKindFilter.value = 'configured';
+  targetKindFilter.onchange();
+  assert.match(observations.innerHTML, /暂无符合筛选条件/);
+  assert.deepEqual(state.observationGets, [17], 'filtering must remain client-side');
+  targetKindFilter = document.getElementById('m-dynamic-observation-target-kind-filter');
+  targetKindFilter.value = 'discovered';
+  targetKindFilter.onchange();
+  assert.match(observations.innerHTML, /https:\/\/media\.example:443/);
 
   await refresh.onclick();
   assert.deepEqual(state.observationGets, [17, 17]);
@@ -940,8 +1013,8 @@ test('edit modal refreshes observations and confirms before clearing them', asyn
   state.confirmationResult = true;
   await clear.onclick();
   assert.deepEqual(state.observationDeletes, [17]);
-  assert.deepEqual(state.successes, ['观察记录已清空']);
-  assert.match(observations.innerHTML, /已丢弃观察记录：0/);
+  assert.deepEqual(state.successes, ['播放路由观察记录已清空']);
+  assert.match(observations.innerHTML, /进程全局队列丢失计数<\/strong>0 条/);
   assert.match(observations.innerHTML, /暂无观察记录/);
   assert.equal(refresh.disabled, false);
   assert.equal(clear.disabled, false);

@@ -550,10 +550,17 @@ if [ "${#upstream_header_key}" -lt 32 ]; then
 fi
 jwt_secret=$(read_env_value JWT_SECRET)
 dynamic_route_key=$(read_env_value DYNAMIC_ROUTE_KEY)
+setup_token=$(read_env_value SETUP_TOKEN)
 if [ "${#jwt_secret}" -lt 32 ] || [ "${#dynamic_route_key}" -lt 32 ]; then
     echo 'FAIL: fresh install must generate JWT_SECRET and DYNAMIC_ROUTE_KEY' >&2
     exit 1
 fi
+if [ "${#setup_token}" -lt 32 ]; then
+    echo 'FAIL: fresh install must generate SETUP_TOKEN' >&2
+    exit 1
+fi
+assert_eq '1' "$(grep -Foc -- "$setup_token" "${TEST_ROOT}/install-first.log")" \
+    'fresh setup token is printed exactly once'
 if [ "$jwt_secret" = "$upstream_header_key" ] \
     || [ "$jwt_secret" = "$dynamic_route_key" ] \
     || [ "$upstream_header_key" = "$dynamic_route_key" ]; then
@@ -626,6 +633,9 @@ if ! (do_install) >"${TEST_ROOT}/install-existing.log" 2>&1; then
     exit 1
 fi
 assert_eq 'v9.9.9' "$(get_current_version)" 'install must not update existing installation'
+assert_contains "${TEST_ROOT}/install-existing.log" '若初始化仍待完成'
+assert_contains "${TEST_ROOT}/install-existing.log" '安装器不会自动显示现有令牌'
+assert_not_contains "${TEST_ROOT}/install-existing.log" "$setup_token"
 
 write_legacy_managed_nginx
 : > "$update_nginx_validation_log"
@@ -643,6 +653,8 @@ assert_contains "$NGINX_CONFIG" 'ssl_protocols TLSv1.2 TLSv1.3;'
 assert_eq '2' "$(grep -Fc 'access_log /var/log/nginx/meridian_access.log meridian_redacted;' "$NGINX_CONFIG")" \
     'update migration redacted access log count'
 assert_eq '1' "$(grep -c '^validate$' "$update_nginx_validation_log")" 'update migration validation count'
+assert_contains "${TEST_ROOT}/update.log" '若初始化仍待完成'
+assert_not_contains "${TEST_ROOT}/update.log" "$setup_token"
 
 backup_count_before=$(run_as_test_root find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')
 if ! (do_update) >"${TEST_ROOT}/update-current.log" 2>&1; then
@@ -652,6 +664,7 @@ fi
 backup_count_after=$(run_as_test_root find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')
 assert_eq "$backup_count_before" "$backup_count_after" 'latest update is a no-op'
 assert_eq '1' "$(grep -c '^validate$' "$update_nginx_validation_log")" 'current update keeps migration idempotent'
+assert_not_contains "${TEST_ROOT}/update-current.log" "$setup_token"
 
 # Older uninitialized installations did not have SETUP_TOKEN in .env. Updating
 # one must backfill a fresh token and tell the operator that it is required.
@@ -662,9 +675,12 @@ if ! (do_update) >"${TEST_ROOT}/update-legacy-setup.log" 2>&1; then
     cat "${TEST_ROOT}/update-legacy-setup.log" >&2
     exit 1
 fi
-[ -n "$(read_env_value SETUP_TOKEN)" ] || { echo 'FAIL: legacy update did not backfill SETUP_TOKEN' >&2; exit 1; }
+legacy_setup_token=$(read_env_value SETUP_TOKEN)
+[ -n "$legacy_setup_token" ] || { echo 'FAIL: legacy update did not backfill SETUP_TOKEN' >&2; exit 1; }
 [ -n "$(read_env_value UPSTREAM_HEADER_KEY)" ] || { echo 'FAIL: legacy update did not backfill UPSTREAM_HEADER_KEY' >&2; exit 1; }
-assert_contains "${TEST_ROOT}/update-legacy-setup.log" '初始化令牌'
+assert_contains "${TEST_ROOT}/update-legacy-setup.log" '初始化令牌（仅显示这一次'
+assert_eq '1' "$(grep -Foc -- "$legacy_setup_token" "${TEST_ROOT}/update-legacy-setup.log")" \
+    'backfilled setup token is printed exactly once'
 
 # A newer installed version must never be silently downgraded.
 MOCK_LATEST='v9.8.0'

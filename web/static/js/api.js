@@ -129,3 +129,43 @@ function esc(str) {
     "'": '&#39;',
   })[char]);
 }
+
+// Shared display-time contract. API payloads stay as epoch/UTC values; every
+// page derives the same China Standard Time labels without consulting the
+// browser's locale or local time zone.
+const SHANGHAI_DATE_TIME_FORMATTER = new Intl.DateTimeFormat('en-CA-u-ca-gregory-nu-latn', {
+  timeZone: 'Asia/Shanghai',
+  calendar: 'gregory',
+  numberingSystem: 'latn',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+});
+
+function formatShanghaiDateTimeParts(value) {
+  if (!(value instanceof Date) && typeof value !== 'number' && typeof value !== 'string') return null;
+  const timestamp = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (!Number.isFinite(timestamp.getTime())) return null;
+
+  const values = Object.create(null);
+  for (const part of SHANGHAI_DATE_TIME_FORMATTER.formatToParts(timestamp)) {
+    if (part.type !== 'literal') values[part.type] = part.value;
+  }
+  if (!/^\d{4}$/.test(values.year || '')
+      || !/^\d{2}$/.test(values.month || '')
+      || !/^\d{2}$/.test(values.day || '')
+      || !/^\d{2}$/.test(values.hour || '')
+      || !/^\d{2}$/.test(values.minute || '')) return null;
+  return {
+    date: `${values.year}-${values.month}-${values.day}`,
+    time: `${values.hour}:${values.minute}`,
+  };
+}
+
+function formatShanghaiDateTime(value) {
+  const parts = formatShanghaiDateTimeParts(value);
+  return parts ? `${parts.date} ${parts.time}` : '不可用';
+}

@@ -336,36 +336,68 @@ const DYNAMIC_FEATURES = [
 	['custom_ca', '自定义 CA', false],
 	['raw_fallback', '原始响应回退', false],
 ];
-const DYNAMIC_OBSERVATION_REASON_CODES = new Set([
-	'redirect_allowed',
-	'candidate_allowed',
-	'invalid_location',
-	'unsupported_status',
-	'redirect_loop',
-	'hop_limit',
-	'scheme_denied',
-	'port_denied',
-	'domain_denied',
-	'https_downgrade_denied',
-	'self_target',
-	'dns_failure',
-	'address_denied',
-	'dial_failure',
-	'tls_failure',
-	'capacity_limit',
-	'rate_limit',
-	'parse_failure',
-	'request_unclassified',
-	'structured_body_limit',
-	'playback_info_denied',
-	'hls_feature_denied',
-	'dash_feature_denied',
-	'redirect_body_replay_denied',
-	'capability_invalid',
-	'capability_expired',
-	'response_failure',
-	'runtime_unavailable',
-]);
+const DYNAMIC_OBSERVATION_MAX_ROWS = 500;
+const DYNAMIC_OBSERVATION_UNAVAILABLE = '不可用';
+const DYNAMIC_OBSERVATION_TARGET_KIND_IDS = ['same_authority', 'configured', 'discovered'];
+const DYNAMIC_OBSERVATION_STAGE_IDS = ['response', 'location', 'policy', 'resolve', 'connect', 'capacity', 'parse', 'capability', 'runtime'];
+const DYNAMIC_OBSERVATION_DECISION_IDS = ['allowed', 'denied'];
+const DYNAMIC_OBSERVATION_SOURCE_LABELS = {
+	redirect: 'HTTP 30x 重定向',
+	playback_info: 'PlaybackInfo 响应',
+	hls: 'HLS 清单',
+	dash: 'DASH 清单',
+};
+const DYNAMIC_OBSERVATION_TARGET_KIND_LABELS = {
+	same_authority: '同权威目标',
+	configured: '已配置目标',
+	discovered: '自动发现目标',
+};
+const DYNAMIC_OBSERVATION_DECISION_LABELS = {
+	allowed: '通过',
+	denied: '拒绝',
+};
+const DYNAMIC_OBSERVATION_STAGE_LABELS = {
+	response: '响应处理',
+	location: 'Location 读取',
+	policy: '安全策略',
+	resolve: 'DNS 解析',
+	connect: '建立连接',
+	capacity: '容量控制',
+	parse: '内容解析',
+	capability: '能力链接',
+	runtime: '运行时',
+};
+const DYNAMIC_OBSERVATION_REASON_LABELS = {
+	redirect_allowed: '重定向目标通过验证',
+	candidate_allowed: '候选目标通过验证',
+	invalid_location: 'Location 无效',
+	unsupported_status: '重定向状态不受支持',
+	redirect_loop: '检测到重定向循环',
+	hop_limit: '达到重定向跳数上限',
+	scheme_denied: '协议不在允许范围',
+	port_denied: '端口不在允许范围',
+	domain_denied: '域名不在允许范围',
+	https_downgrade_denied: 'HTTPS 降级被拒绝',
+	self_target: '目标指向当前站点',
+	dns_failure: 'DNS 解析失败',
+	address_denied: '解析地址被安全策略拒绝',
+	dial_failure: '目标连接失败',
+	tls_failure: 'TLS 连接失败',
+	capacity_limit: '达到容量上限',
+	rate_limit: '达到新目标速率上限',
+	parse_failure: '响应解析失败',
+	request_unclassified: '请求类型无法分类',
+	structured_body_limit: '结构化响应正文超过上限',
+	playback_info_denied: 'PlaybackInfo 处理被拒绝',
+	hls_feature_denied: 'HLS 解析未启用',
+	dash_feature_denied: 'DASH 解析未启用',
+	redirect_body_replay_denied: '重定向请求体重放被拒绝',
+	capability_invalid: '能力链接无效',
+	capability_expired: '能力链接已过期',
+	response_failure: '上游响应失败',
+	runtime_unavailable: '运行时不可用',
+};
+const DYNAMIC_OBSERVATION_REASON_CODES = new Set(Object.keys(DYNAMIC_OBSERVATION_REASON_LABELS));
 
 function hasOwnDynamicField(value, field) {
 	return Object.prototype.hasOwnProperty.call(value, field);
@@ -724,73 +756,170 @@ function privacySafeObservationAuthority(value) {
 }
 
 function privacySafeObservationReason(value) {
-	return typeof value === 'string' && DYNAMIC_OBSERVATION_REASON_CODES.has(value) ? value : '—';
+	return typeof value === 'string' && DYNAMIC_OBSERVATION_REASON_CODES.has(value) ? value : '';
 }
 
-function formatObservationTimestamp(value) {
-	if (!Number.isSafeInteger(value) || value < 0) return '—';
-	const timestamp = new Date(value);
-	return Number.isNaN(timestamp.getTime()) ? '—' : timestamp.toISOString();
+function privacySafeObservationTimestamp(value) {
+	if (!Number.isSafeInteger(value) || value < 0) return null;
+	return formatShanghaiDateTimeParts(value);
+}
+
+function privacySafeObservationMetadata(value, allowZero) {
+	return Number.isSafeInteger(value) && (allowZero ? value >= 0 : value > 0) ? value : null;
+}
+
+function privacySafeRedirectStatus(value) {
+	return Number.isSafeInteger(value) && (value === 0 || (value >= 300 && value <= 399)) ? value : null;
 }
 
 function normalizeDynamicObservationsResponse(value) {
 	const response = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 	const observations = Array.isArray(response.observations) ? response.observations : [];
 	return {
-		observations: observations.map(observation => {
+		// The API is latest-first. Slice before mapping so even a malformed
+		// response cannot trigger unbounded client-side allocation or DOM work.
+		observations: observations.slice(0, DYNAMIC_OBSERVATION_MAX_ROWS).map(observation => {
 			const item = observation && typeof observation === 'object' && !Array.isArray(observation) ? observation : {};
 			return {
 				authority: privacySafeObservationAuthority(item.canonical_authority),
-				source: DYNAMIC_SOURCE_IDS.includes(item.source) ? item.source : '—',
-				decision: item.decision === 'allowed' || item.decision === 'denied' ? item.decision : '—',
+				source: DYNAMIC_SOURCE_IDS.includes(item.source) ? item.source : '',
+				targetKind: DYNAMIC_OBSERVATION_TARGET_KIND_IDS.includes(item.target_kind) ? item.target_kind : '',
+				stage: DYNAMIC_OBSERVATION_STAGE_IDS.includes(item.stage) ? item.stage : '',
+				decision: DYNAMIC_OBSERVATION_DECISION_IDS.includes(item.decision) ? item.decision : '',
 				reason: privacySafeObservationReason(item.reason_code),
-				firstSeen: formatObservationTimestamp(item.first_seen_ms),
-				lastSeen: formatObservationTimestamp(item.last_seen_ms),
-				count: Number.isSafeInteger(item.count) && item.count > 0 ? item.count : '—',
+				redirectStatus: privacySafeRedirectStatus(item.redirect_status),
+				firstSeen: privacySafeObservationTimestamp(item.first_seen_ms),
+				lastSeen: privacySafeObservationTimestamp(item.last_seen_ms),
+				count: privacySafeObservationMetadata(item.count, false),
 			};
 		}),
-		dropped: Number.isSafeInteger(response.dropped_observations) && response.dropped_observations >= 0
-			? response.dropped_observations
-			: '—',
+		droppedObservationsGlobal: privacySafeObservationMetadata(response.dropped_observations_global, true),
+		retentionDays: privacySafeObservationMetadata(response.retention_days, false),
+		perSiteRowLimit: privacySafeObservationMetadata(response.per_site_row_limit, false),
+		globalRowLimit: privacySafeObservationMetadata(response.global_row_limit, false),
 	};
 }
 
-function renderDynamicObservations(value) {
-	const response = normalizeDynamicObservationsResponse(value);
-	const rows = response.observations.map(observation => `
+function normalizeDynamicObservationFilters(value) {
+	const filters = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+	return {
+		decision: DYNAMIC_OBSERVATION_DECISION_IDS.includes(filters.decision) ? filters.decision : '',
+		source: DYNAMIC_SOURCE_IDS.includes(filters.source) ? filters.source : '',
+		targetKind: DYNAMIC_OBSERVATION_TARGET_KIND_IDS.includes(filters.targetKind) ? filters.targetKind : '',
+	};
+}
+
+function filterDynamicObservations(observations, value) {
+	const filters = normalizeDynamicObservationFilters(value);
+	return (Array.isArray(observations) ? observations : []).filter(observation => (
+		(!filters.decision || observation.decision === filters.decision)
+		&& (!filters.source || observation.source === filters.source)
+		&& (!filters.targetKind || observation.targetKind === filters.targetKind)
+	));
+}
+
+function dynamicObservationLabel(labels, value) {
+	return Object.prototype.hasOwnProperty.call(labels, value) ? labels[value] : DYNAMIC_OBSERVATION_UNAVAILABLE;
+}
+
+function dynamicObservationRedirectStatusLabel(value) {
+	if (value === 0) return '非重定向';
+	return Number.isSafeInteger(value) && value >= 300 && value <= 399
+		? `HTTP ${value}`
+		: DYNAMIC_OBSERVATION_UNAVAILABLE;
+}
+
+function renderDynamicObservationTime(value) {
+	if (!value) return `<span class="dynamic-observation-unavailable">${DYNAMIC_OBSERVATION_UNAVAILABLE}</span>`;
+	const date = esc(value.date);
+	const time = esc(value.time);
+	return `<time class="dynamic-observation-time" datetime="${date}T${time}:00+08:00" aria-label="${date} ${time} 中国标准时间"><span>${date}</span><span>${time}</span></time>`;
+}
+
+function renderDynamicObservationReason(value) {
+	if (!DYNAMIC_OBSERVATION_REASON_CODES.has(value)) return `<span class="dynamic-observation-unavailable">${DYNAMIC_OBSERVATION_UNAVAILABLE}</span>`;
+	return `<span class="dynamic-observation-reason-label">${esc(DYNAMIC_OBSERVATION_REASON_LABELS[value])}</span><code>${esc(value)}</code>`;
+}
+
+function renderDynamicObservationNumber(value, suffix) {
+	return value === null ? DYNAMIC_OBSERVATION_UNAVAILABLE : `${String(value)}${suffix || ''}`;
+}
+
+function renderDynamicObservationFilterOptions(values, labels, selected, allLabel) {
+	return `<option value="">${esc(allLabel)}</option>${values.map(value => (
+		`<option value="${esc(value)}" ${selected === value ? 'selected' : ''}>${esc(labels[value])}</option>`
+	)).join('')}`;
+}
+
+function renderNormalizedDynamicObservations(response, filterValue) {
+	const filters = normalizeDynamicObservationFilters(filterValue);
+	const visibleObservations = filterDynamicObservations(response.observations, filters);
+	const rows = visibleObservations.map(observation => `
 		<tr>
-		  <td>${esc(observation.authority)}</td>
-		  <td>${esc(observation.source)}</td>
-		  <td>${esc(observation.decision)}</td>
-		  <td>${esc(observation.reason)}</td>
-		  <td>${esc(observation.firstSeen)}</td>
-		  <td>${esc(observation.lastSeen)}</td>
-		  <td>${esc(observation.count)}</td>
+		  <td class="mono">${esc(observation.authority === '—' ? DYNAMIC_OBSERVATION_UNAVAILABLE : observation.authority)}</td>
+		  <td>${esc(dynamicObservationLabel(DYNAMIC_OBSERVATION_TARGET_KIND_LABELS, observation.targetKind))}</td>
+		  <td>${esc(dynamicObservationLabel(DYNAMIC_OBSERVATION_SOURCE_LABELS, observation.source))}</td>
+		  <td>${esc(dynamicObservationLabel(DYNAMIC_OBSERVATION_DECISION_LABELS, observation.decision))}</td>
+		  <td>${esc(dynamicObservationLabel(DYNAMIC_OBSERVATION_STAGE_LABELS, observation.stage))}</td>
+		  <td class="dynamic-observation-reason">${renderDynamicObservationReason(observation.reason)}</td>
+		  <td>${esc(dynamicObservationRedirectStatusLabel(observation.redirectStatus))}</td>
+		  <td>${renderDynamicObservationTime(observation.firstSeen)}</td>
+		  <td>${renderDynamicObservationTime(observation.lastSeen)}</td>
+		  <td>${esc(renderDynamicObservationNumber(observation.count))}</td>
 		</tr>
 	`).join('');
 	return `
-		<div class="form-help">已丢弃观察记录：${esc(response.dropped)}</div>
+		<div class="dynamic-observation-metadata" aria-label="观察记录保留与容量边界">
+		  <span><strong>保留时间</strong>${esc(renderDynamicObservationNumber(response.retentionDays, ' 天'))}</span>
+		  <span><strong>单站点上限</strong>${esc(renderDynamicObservationNumber(response.perSiteRowLimit, ' 条'))}</span>
+		  <span><strong>全局存储上限</strong>${esc(renderDynamicObservationNumber(response.globalRowLimit, ' 条'))}</span>
+		  <span class="dynamic-observation-global-loss"><strong>进程全局队列丢失计数</strong>${esc(renderDynamicObservationNumber(response.droppedObservationsGlobal, ' 条'))}</span>
+		</div>
+		<div class="form-help dynamic-observation-global-loss-help">进程全局队列丢失计数跨全部站点累计，只表示有界非阻塞观察队列未能接收的记录数量。</div>
+		<div class="dynamic-observation-filters" aria-label="播放路由观察记录筛选">
+		  <label for="m-dynamic-observation-decision-filter">决策
+			<select class="form-select" id="m-dynamic-observation-decision-filter">
+			  ${renderDynamicObservationFilterOptions(DYNAMIC_OBSERVATION_DECISION_IDS, DYNAMIC_OBSERVATION_DECISION_LABELS, filters.decision, '全部决策')}
+			</select>
+		  </label>
+		  <label for="m-dynamic-observation-source-filter">来源
+			<select class="form-select" id="m-dynamic-observation-source-filter">
+			  ${renderDynamicObservationFilterOptions(DYNAMIC_SOURCE_IDS, DYNAMIC_OBSERVATION_SOURCE_LABELS, filters.source, '全部来源')}
+			</select>
+		  </label>
+		  <label for="m-dynamic-observation-target-kind-filter">目标类型
+			<select class="form-select" id="m-dynamic-observation-target-kind-filter">
+			  ${renderDynamicObservationFilterOptions(DYNAMIC_OBSERVATION_TARGET_KIND_IDS, DYNAMIC_OBSERVATION_TARGET_KIND_LABELS, filters.targetKind, '全部目标类型')}
+			</select>
+		  </label>
+		</div>
+		<div class="form-help dynamic-observation-result-count" role="status">显示 ${visibleObservations.length} / ${response.observations.length} 条</div>
 		${rows ? `
-		<div style="overflow-x:auto;margin-top:8px">
-		  <table>
-			<thead><tr><th>规范化权威</th><th>来源</th><th>决策</th><th>原因代码</th><th>首次观察</th><th>最近观察</th><th>次数</th></tr></thead>
+		<div class="dynamic-observation-table-wrap">
+		  <table class="dynamic-observation-table">
+			<thead><tr><th>目标权威</th><th>目标类型</th><th>来源</th><th>决策</th><th>阶段</th><th>原因</th><th>3xx 状态</th><th>首次观察</th><th>最近观察</th><th>次数</th></tr></thead>
 			<tbody>${rows}</tbody>
 		  </table>
-		</div>` : '<div class="form-help" style="margin-top:8px">暂无观察记录。</div>'}
+		</div>` : `<div class="form-help dynamic-observation-empty">${response.observations.length ? '暂无符合筛选条件的观察记录。' : '暂无观察记录。'}</div>`}
 	`;
+}
+
+function renderDynamicObservations(value, filters) {
+	return renderNormalizedDynamicObservations(normalizeDynamicObservationsResponse(value), filters);
 }
 
 function renderDynamicObservationsPanel(supported) {
 	return `
 		<details class="site-disclosure" id="m-dynamic-observations-disclosure">
-		  <summary>自动发现观察记录</summary>
+		  <summary>播放路由观察记录</summary>
 		  <div class="site-disclosure-body">
-			<div class="form-help">仅显示规范化权威、有限原因代码和聚合时间/次数；不显示完整 URL、路径、查询参数、令牌、请求头或正文。</div>
+			<div class="form-help">“通过”只表示路由与安全校验通过，不代表播放成功。</div>
+			<div class="form-help">仅显示规范化目标权威、有限枚举/原因代码和聚合时间/次数；不显示完整 URL、路径、查询参数、令牌、请求头或正文。</div>
 			<div class="form-inline-actions">
 			  <button type="button" class="btn-ghost" id="m-refresh-dynamic-observations" ${supported ? '' : 'disabled'}>刷新</button>
 			  <button type="button" class="btn-ghost danger" id="m-clear-dynamic-observations" ${supported ? '' : 'disabled'}>清空</button>
 			</div>
-			<div id="m-dynamic-observations">${supported ? '<div class="form-help">正在读取观察记录…</div>' : '<div class="form-help">当前后端不提供自动发现观察记录。</div>'}</div>
+			<div id="m-dynamic-observations">${supported ? '<div class="form-help">正在读取观察记录…</div>' : '<div class="form-help">当前后端不提供播放路由观察记录。</div>'}</div>
 		  </div>
 		</details>
 	`;
@@ -1035,6 +1164,7 @@ async function showSiteModal(site) {
                 <option value="direct" ${(!isEdit || site.playback_mode !== 'redirect') ? 'selected' : ''}>直连分流</option>
                 <option value="redirect" ${isEdit && site.playback_mode === 'redirect' ? 'selected' : ''}>重定向跟随</option>
               </select>
+              <div class="form-help">重定向跟随仅对非 Upgrade 的 GET/HEAD 生效，处理 301/302/303/307/308，最多 5 跳；每一跳必须精确命中已配置播放回源，跨权威会清除 Cookie、Authorization、Emby Token 和固定上游 Header。POST/PUT/DELETE 与请求正文不会跟随。</div>
             </div>
             <div class="form-group">
               <label for="m-ua">UA 模式</label>
@@ -1252,6 +1382,8 @@ async function showSiteModal(site) {
 	const refreshDynamicObservationsButton = isEdit ? document.getElementById('m-refresh-dynamic-observations') : null;
 	const clearDynamicObservationsButton = isEdit ? document.getElementById('m-clear-dynamic-observations') : null;
 	let dynamicObservationRequest = 0;
+	let dynamicObservationResponse = normalizeDynamicObservationsResponse(null);
+	let dynamicObservationFilters = normalizeDynamicObservationFilters(null);
 
 	function dynamicObservationsPanelIsCurrent() {
 		return dynamicObservationsContainer && document.getElementById('m-dynamic-observations') === dynamicObservationsContainer;
@@ -1262,6 +1394,34 @@ async function showSiteModal(site) {
 		if (clearDynamicObservationsButton) clearDynamicObservationsButton.disabled = disabled;
 	}
 
+	function paintDynamicObservations() {
+		if (!dynamicObservationsPanelIsCurrent()) return;
+		dynamicObservationsContainer.innerHTML = renderNormalizedDynamicObservations(dynamicObservationResponse, dynamicObservationFilters);
+		for (const [id, field] of [
+			['m-dynamic-observation-decision-filter', 'decision'],
+			['m-dynamic-observation-source-filter', 'source'],
+			['m-dynamic-observation-target-kind-filter', 'targetKind'],
+		]) {
+			const control = document.getElementById(id);
+			if (!control) continue;
+			control.value = dynamicObservationFilters[field];
+			control.onchange = () => {
+				dynamicObservationFilters = normalizeDynamicObservationFilters({
+					...dynamicObservationFilters,
+					[field]: control.value,
+				});
+				paintDynamicObservations();
+			};
+		}
+	}
+
+	function displayDynamicObservations(response) {
+		// Retain only the strict aggregate contract; never keep arbitrary API
+		// fields in client-side filter state.
+		dynamicObservationResponse = normalizeDynamicObservationsResponse(response);
+		paintDynamicObservations();
+	}
+
 	async function refreshDynamicObservations() {
 		if (!isEdit || !dynamicCapabilities.recognized || !dynamicObservationsContainer) return;
 		const request = ++dynamicObservationRequest;
@@ -1270,10 +1430,10 @@ async function showSiteModal(site) {
 		try {
 			const response = await API.getDynamicObservations(site.id);
 			if (request !== dynamicObservationRequest || !dynamicObservationsPanelIsCurrent()) return;
-			dynamicObservationsContainer.innerHTML = renderDynamicObservations(response);
+			displayDynamicObservations(response);
 		} catch (_) {
 			if (request !== dynamicObservationRequest || !dynamicObservationsPanelIsCurrent()) return;
-			dynamicObservationsContainer.innerHTML = '<div class="form-help" style="color:var(--orange)">无法读取观察记录；未显示任何后端返回值。</div>';
+			dynamicObservationsContainer.innerHTML = '<div class="form-help dynamic-observation-error">无法读取观察记录；未显示任何后端返回值。</div>';
 		} finally {
 			if (request === dynamicObservationRequest && dynamicObservationsPanelIsCurrent()) setDynamicObservationButtonsDisabled(false);
 		}
@@ -1282,16 +1442,16 @@ async function showSiteModal(site) {
 	if (isEdit && dynamicCapabilities.recognized) {
 		refreshDynamicObservationsButton.onclick = refreshDynamicObservations;
 		clearDynamicObservationsButton.onclick = async () => {
-			if (!window.confirm('确定清空本站点的全部动态观察记录吗？此操作不可撤销。')) return;
+			if (!window.confirm('确定清空本站点的全部播放路由观察记录吗？此操作不可撤销。')) return;
 			const request = ++dynamicObservationRequest;
 			setDynamicObservationButtonsDisabled(true);
 			try {
 				const response = await API.deleteDynamicObservations(site.id);
 				if (request !== dynamicObservationRequest || !dynamicObservationsPanelIsCurrent()) return;
-				dynamicObservationsContainer.innerHTML = renderDynamicObservations(response);
-				Toast.success('观察记录已清空');
+				displayDynamicObservations(response);
+				Toast.success('播放路由观察记录已清空');
 			} catch (_) {
-				if (request === dynamicObservationRequest && dynamicObservationsPanelIsCurrent()) Toast.error('无法清空观察记录');
+				if (request === dynamicObservationRequest && dynamicObservationsPanelIsCurrent()) Toast.error('无法清空播放路由观察记录');
 			} finally {
 				if (request === dynamicObservationRequest && dynamicObservationsPanelIsCurrent()) setDynamicObservationButtonsDisabled(false);
 			}

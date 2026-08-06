@@ -1065,7 +1065,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded index HTML: %v", err)
 	}
-	for _, asset := range []string{"/css/style.css?v=1.9.0", "/js/pages/sites.js?v=1.9.0", "/js/app.js?v=1.9.0"} {
+	for _, asset := range []string{"/css/style.css?v=1.9.1", "/js/pages/sites.js?v=1.9.1", "/js/app.js?v=1.9.1"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -2387,7 +2387,7 @@ func TestRedirectFollowKeepsHeadersSameOrigin(t *testing.T) {
 			if calls == 1 {
 				return &http.Response{
 					StatusCode: http.StatusFound,
-					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
+					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream/redirected"}},
 					Body:       io.NopCloser(strings.NewReader("")),
 					Request:    request,
 				}, nil
@@ -2733,7 +2733,7 @@ func TestRedirectFollowPassthroughSameOriginKeepsAuth(t *testing.T) {
 			if calls == 1 {
 				return &http.Response{
 					StatusCode: http.StatusFound,
-					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
+					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream/redirected"}},
 					Body:       io.NopCloser(strings.NewReader("")),
 					Request:    request,
 				}, nil

@@ -32,7 +32,7 @@ function renderTraffic() {
       </div>
       <canvas id="trafficChart" tabindex="0" role="img" aria-label="每分钟入站和出站流量平滑趋势曲线，按下并拖动或使用方向键选择具体分钟"></canvas>
       <div class="traffic-axis-label traffic-axis-y">每分钟流量</div>
-      <div class="traffic-axis-label traffic-axis-x">时间（本地时区）</div>
+      <div class="traffic-axis-label traffic-axis-x">时间（Asia/Shanghai）</div>
       <div class="traffic-point-detail" id="traffic-point-detail" aria-live="polite" hidden></div>
     </div>
     <div class="traffic-totals" id="traffic-totals"></div>`;
@@ -186,7 +186,8 @@ function renderTrafficTotals(buckets, minutes) {
 }
 
 function formatTrafficMinute(timestamp) {
-  return new Date(timestamp * 1000).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+  if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp > Number.MAX_SAFE_INTEGER / 1000) return '不可用';
+  return formatShanghaiDateTime(timestamp * 1000);
 }
 
 function selectedTrafficPointIndex() {
@@ -213,7 +214,7 @@ function updateTrafficPointDetail() {
   }
   const bucket = trafficChartState.buckets[index];
   detail.hidden = false;
-  detail.innerHTML = `<strong class="traffic-detail-time">${formatTrafficMinute(bucket.minute_start_unix)}</strong>
+  detail.innerHTML = `<time class="traffic-detail-time">${formatTrafficMinute(bucket.minute_start_unix)}</time>
     <span><i class="legend-dot in" aria-hidden="true"></i>入站 ${formatBytes(bucket.bytes_in)}</span>
     <span><i class="legend-dot out" aria-hidden="true"></i>出站 ${formatBytes(bucket.bytes_out)}</span>
     <span>请求 ${bucket.requests.toLocaleString()}</span>`;

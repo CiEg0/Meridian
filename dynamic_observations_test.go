@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,11 @@ import (
 )
 
 const dynamicObservationTestInsertSQL = `
+	INSERT INTO dynamic_observations
+		(site_id, canonical_authority, source, target_kind, stage, decision, reason_code, redirect_status, first_seen_ms, last_seen_ms, count)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+const legacyDynamicObservationTestInsertSQL = `
 	INSERT INTO dynamic_observations
 		(site_id, canonical_authority, source, decision, reason_code, first_seen_ms, last_seen_ms, count)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -42,7 +48,11 @@ func openDynamicObservationTestDB(t *testing.T) (*DB, string) {
 
 func createDynamicObservationTestSite(t *testing.T, db *DB, name string) *Site {
 	t.Helper()
-	site, err := db.CreateSite(name, 19001, "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	var siteCount int
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM sites").Scan(&siteCount); err != nil {
+		t.Fatalf("count observation sites: %v", err)
+	}
+	site, err := db.CreateSite(name, 19001+siteCount, "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
 	if err != nil {
 		t.Fatalf("create observation site: %v", err)
 	}
@@ -54,8 +64,10 @@ func allowedDynamicObservationTestEvent(siteID int64, authority string) dynamicO
 		SiteID:             siteID,
 		CanonicalAuthority: authority,
 		Source:             dynamicObservationSourceRedirect,
+		TargetKind:         dynamicObservationTargetDiscovered,
 		Decision:           dynamicObservationDecisionAllowed,
 		ReasonCode:         dynamicObservationReasonRedirectAllowed,
+		RedirectStatus:     0,
 	}
 }
 
@@ -223,14 +235,14 @@ func createPreviousV18DynamicObservationFixture(t *testing.T, path string) map[s
 	}
 	now := time.Now().UnixMilli()
 	rows := []DynamicObservation{
-		{SiteID: 1, CanonicalAuthority: "https://previous-redirect.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed, FirstSeenMS: now - 8000, LastSeenMS: now - 7000, Count: 2},
-		{SiteID: 1, CanonicalAuthority: "https://previous-playback.example.com:443", Source: dynamicObservationSourcePlaybackInfo, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonCandidateAllowed, FirstSeenMS: now - 6000, LastSeenMS: now - 5000, Count: 3},
-		{SiteID: 1, CanonicalAuthority: "https://previous-hls.example.com:443", Source: dynamicObservationSourceHLS, Decision: dynamicObservationDecisionDenied, ReasonCode: dynamicObservationReasonParseFailure, FirstSeenMS: now - 4000, LastSeenMS: now - 3000, Count: 4},
-		{SiteID: 1, CanonicalAuthority: "https://previous-dash.example.com:443", Source: dynamicObservationSourceDASH, Decision: dynamicObservationDecisionDenied, ReasonCode: dynamicObservationReasonCapabilityExpired, FirstSeenMS: now - 2000, LastSeenMS: now - 1000, Count: 5},
+		migratedDynamicObservation(DynamicObservation{SiteID: 1, CanonicalAuthority: "https://previous-redirect.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed, FirstSeenMS: now - 8000, LastSeenMS: now - 7000, Count: 2}),
+		migratedDynamicObservation(DynamicObservation{SiteID: 1, CanonicalAuthority: "https://previous-playback.example.com:443", Source: dynamicObservationSourcePlaybackInfo, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonCandidateAllowed, FirstSeenMS: now - 6000, LastSeenMS: now - 5000, Count: 3}),
+		migratedDynamicObservation(DynamicObservation{SiteID: 1, CanonicalAuthority: "https://previous-hls.example.com:443", Source: dynamicObservationSourceHLS, Decision: dynamicObservationDecisionDenied, ReasonCode: dynamicObservationReasonParseFailure, FirstSeenMS: now - 4000, LastSeenMS: now - 3000, Count: 4}),
+		migratedDynamicObservation(DynamicObservation{SiteID: 1, CanonicalAuthority: "https://previous-dash.example.com:443", Source: dynamicObservationSourceDASH, Decision: dynamicObservationDecisionDenied, ReasonCode: dynamicObservationReasonCapabilityExpired, FirstSeenMS: now - 2000, LastSeenMS: now - 1000, Count: 5}),
 	}
 	expected := make(map[string]DynamicObservation, len(rows))
 	for _, row := range rows {
-		if _, err := db.Exec(dynamicObservationTestInsertSQL, row.SiteID, row.CanonicalAuthority, row.Source, row.Decision, row.ReasonCode, row.FirstSeenMS, row.LastSeenMS, row.Count); err != nil {
+		if _, err := db.Exec(legacyDynamicObservationTestInsertSQL, row.SiteID, row.CanonicalAuthority, row.Source, row.Decision, row.ReasonCode, row.FirstSeenMS, row.LastSeenMS, row.Count); err != nil {
 			_ = db.Close()
 			t.Fatalf("insert previous v1.8 observation %q: %v", row.CanonicalAuthority, err)
 		}
@@ -240,6 +252,93 @@ func createPreviousV18DynamicObservationFixture(t *testing.T, path string) map[s
 		t.Fatalf("close previous v1.8 observation fixture: %v", err)
 	}
 	return expected
+}
+
+func migratedDynamicObservation(row DynamicObservation) DynamicObservation {
+	row.TargetKind = dynamicObservationTargetDiscovered
+	row.Stage, _ = dynamicObservationStageForReason(row.ReasonCode)
+	row.RedirectStatus = 0
+	return row
+}
+
+func createPreviousV19DynamicObservationFixture(t *testing.T, path string) map[string]DynamicObservation {
+	t.Helper()
+	createV17ObservationFixture(t, path)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open previous v1.9 observation fixture: %v", err)
+	}
+	if _, err := db.Exec(dynamicObservationV19TableDDL + dynamicObservationIndexesDDL); err != nil {
+		_ = db.Close()
+		t.Fatalf("create previous v1.9 observation schema: %v", err)
+	}
+	now := time.Now().UnixMilli()
+	rows := []DynamicObservation{
+		migratedDynamicObservation(DynamicObservation{SiteID: 1, CanonicalAuthority: "https://v19-redirect.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed, FirstSeenMS: now - 7000, LastSeenMS: now - 6000, Count: 7}),
+		migratedDynamicObservation(DynamicObservation{SiteID: 1, CanonicalAuthority: "https://v19-playback.example.com:443", Source: dynamicObservationSourcePlaybackInfo, Decision: dynamicObservationDecisionDenied, ReasonCode: dynamicObservationReasonStructuredBodyLimit, FirstSeenMS: now - 5000, LastSeenMS: now - 3000, Count: 11}),
+		migratedDynamicObservation(DynamicObservation{SiteID: 1, CanonicalAuthority: "https://v19-runtime.example.com:443", Source: dynamicObservationSourceDASH, Decision: dynamicObservationDecisionDenied, ReasonCode: dynamicObservationReasonRuntimeUnavailable, FirstSeenMS: now - 2000, LastSeenMS: now - 1000, Count: 13}),
+	}
+	expected := make(map[string]DynamicObservation, len(rows))
+	for _, row := range rows {
+		if _, err := db.Exec(legacyDynamicObservationTestInsertSQL, row.SiteID, row.CanonicalAuthority, row.Source, row.Decision, row.ReasonCode, row.FirstSeenMS, row.LastSeenMS, row.Count); err != nil {
+			_ = db.Close()
+			t.Fatalf("insert previous v1.9 observation %q: %v", row.CanonicalAuthority, err)
+		}
+		expected[row.CanonicalAuthority] = row
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close previous v1.9 observation fixture: %v", err)
+	}
+	return expected
+}
+
+func createPreviousV19DynamicObservationLimitFixture(t *testing.T, path string) (int64, int) {
+	t.Helper()
+	createV17ObservationFixture(t, path)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open bounded v1.9 observation fixture: %v", err)
+	}
+	if _, err := db.Exec(dynamicObservationV19TableDDL + dynamicObservationIndexesDDL); err != nil {
+		_ = db.Close()
+		t.Fatalf("create bounded v1.9 observation schema: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("begin bounded v1.9 observation fixture: %v", err)
+	}
+	statement, err := tx.Prepare(legacyDynamicObservationTestInsertSQL)
+	if err != nil {
+		_ = tx.Rollback()
+		_ = db.Close()
+		t.Fatalf("prepare bounded v1.9 observation fixture: %v", err)
+	}
+	base := time.Now().Add(-time.Hour).UnixMilli()
+	total := dynamicObservationPerSiteRowLimit + 2
+	for index := range total {
+		authority := fmt.Sprintf("https://v19-limit-%05d.example.com:443", index)
+		seen := base + int64(index)
+		if _, err := statement.Exec(1, authority, dynamicObservationSourcePlaybackInfo, dynamicObservationDecisionAllowed, dynamicObservationReasonCandidateAllowed, seen, seen, 1); err != nil {
+			_ = statement.Close()
+			_ = tx.Rollback()
+			_ = db.Close()
+			t.Fatalf("insert bounded v1.9 observation %d: %v", index, err)
+		}
+	}
+	if err := statement.Close(); err != nil {
+		_ = tx.Rollback()
+		_ = db.Close()
+		t.Fatalf("close bounded v1.9 observation statement: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		_ = db.Close()
+		t.Fatalf("commit bounded v1.9 observation fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close bounded v1.9 observation fixture: %v", err)
+	}
+	return base, total
 }
 
 func requireDynamicObservationRows(t *testing.T, db *DB, siteID int64, expected map[string]DynamicObservation) {
@@ -264,32 +363,56 @@ func requireDynamicObservationRows(t *testing.T, db *DB, siteID int64, expected 
 	}
 }
 
+func requirePrunedV19DynamicObservationRows(t *testing.T, db *DB, base int64, total int) {
+	t.Helper()
+	observations, err := db.ListDynamicObservations(1)
+	if err != nil {
+		t.Fatalf("list bounded v1.9 observations: %v", err)
+	}
+	if len(observations) != dynamicObservationPerSiteRowLimit {
+		t.Fatalf("bounded v1.9 observations=%d, want %d", len(observations), dynamicObservationPerSiteRowLimit)
+	}
+	for position, observation := range observations {
+		index := total - 1 - position
+		seen := base + int64(index)
+		want := migratedDynamicObservation(DynamicObservation{
+			SiteID:             1,
+			CanonicalAuthority: fmt.Sprintf("https://v19-limit-%05d.example.com:443", index),
+			Source:             dynamicObservationSourcePlaybackInfo,
+			Decision:           dynamicObservationDecisionAllowed,
+			ReasonCode:         dynamicObservationReasonCandidateAllowed,
+			FirstSeenMS:        seen,
+			LastSeenMS:         seen,
+			Count:              1,
+		})
+		if observation != want {
+			t.Fatalf("bounded v1.9 observation[%d]=%#v, want=%#v", position, observation, want)
+		}
+	}
+}
+
 func createMalformedDynamicObservationFixture(t *testing.T, path, variant string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("open malformed observation fixture: %v", err)
 	}
-	extraColumn := ""
-	if variant == "extra privacy-bearing column" {
-		extraColumn = ", leaked_url TEXT NOT NULL"
-	}
-	schema := fmt.Sprintf(`
-		CREATE TABLE dynamic_observations (
-			site_id INTEGER NOT NULL,
-			canonical_authority TEXT NOT NULL,
-			source TEXT NOT NULL,
-			decision TEXT NOT NULL,
-			reason_code TEXT NOT NULL,
-			first_seen_ms INTEGER NOT NULL,
-			last_seen_ms INTEGER NOT NULL,
-			count INTEGER NOT NULL%s,
-			PRIMARY KEY(site_id, canonical_authority, source, decision, reason_code)
-		) WITHOUT ROWID;
-	`, extraColumn)
-	if variant == "wrong core index" {
-		schema += `CREATE INDEX idx_dynamic_observations_site_last_seen
-			ON dynamic_observations(canonical_authority, last_seen_ms);`
+	var schema string
+	switch variant {
+	case "extra privacy-bearing column":
+		schema = strings.Replace(dynamicObservationTableDDL, "\tcount INTEGER NOT NULL CHECK(count > 0),", "\tcount INTEGER NOT NULL CHECK(count > 0),\n\tleaked_url TEXT NOT NULL,", 1) + dynamicObservationIndexesDDL
+	case "wrong core index":
+		schema = dynamicObservationTableDDL + `
+			CREATE INDEX idx_dynamic_observations_site_last_seen
+				ON dynamic_observations(canonical_authority, last_seen_ms DESC);
+			CREATE INDEX idx_dynamic_observations_last_seen
+				ON dynamic_observations(last_seen_ms);`
+	case "recognized v1.9 with extra column":
+		schema = strings.Replace(dynamicObservationV19TableDDL, "\tcount INTEGER NOT NULL CHECK(count > 0),", "\tcount INTEGER NOT NULL CHECK(count > 0),\n\tleaked_url TEXT NOT NULL,", 1) + dynamicObservationIndexesDDL
+	case "recognized previous route schema with extra column":
+		schema = strings.Replace(dynamicObservationPreviousTableDDL, "\tcount INTEGER NOT NULL CHECK(count > 0),", "\tcount INTEGER NOT NULL CHECK(count > 0),\n\tleaked_url TEXT NOT NULL,", 1) + dynamicObservationIndexesDDL
+	default:
+		t.Fatalf("unknown malformed schema variant %q", variant)
 	}
 	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
@@ -364,6 +487,44 @@ func TestDynamicObservationMigrationEmptyAndV17IsIdempotent(t *testing.T) {
 		}
 	})
 
+	t.Run("previous v1.9 observation schema", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "previous-v1.9-observations.db")
+		expected := createPreviousV19DynamicObservationFixture(t, path)
+		migrated, err := openDB(path)
+		if err != nil {
+			t.Fatalf("migrate previous v1.9 observations: %v", err)
+		}
+		t.Cleanup(migrated.Close)
+		requireDynamicObservationRows(t, migrated, 1, expected)
+		if err := migrated.migrate(); err != nil {
+			t.Fatalf("repeat v1.9 observation migration: %v", err)
+		}
+		requireDynamicObservationRows(t, migrated, 1, expected)
+	})
+
+	t.Run("previous v1.9 observation limit is immediate and idempotent", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "bounded-v1.9-observations.db")
+		base, total := createPreviousV19DynamicObservationLimitFixture(t, path)
+		migrated, err := openDB(path)
+		if err != nil {
+			t.Fatalf("migrate bounded v1.9 observations: %v", err)
+		}
+		t.Cleanup(migrated.Close)
+		requirePrunedV19DynamicObservationRows(t, migrated, base, total)
+		if err := migrated.migrate(); err != nil {
+			t.Fatalf("repeat bounded v1.9 observation migration: %v", err)
+		}
+		requirePrunedV19DynamicObservationRows(t, migrated, base, total)
+		migrated.Close()
+
+		reopened, err := openDB(path)
+		if err != nil {
+			t.Fatalf("reopen bounded v1.9 observations: %v", err)
+		}
+		t.Cleanup(reopened.Close)
+		requirePrunedV19DynamicObservationRows(t, reopened, base, total)
+	})
+
 	t.Run("previous v1.8 observation constraints", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "previous-v1.8-observations.db")
 		expected := createPreviousV18DynamicObservationFixture(t, path)
@@ -391,8 +552,10 @@ func TestDynamicObservationMigrationEmptyAndV17IsIdempotent(t *testing.T) {
 				SiteID:             1,
 				CanonicalAuthority: authority,
 				Source:             reasonCase.source,
+				TargetKind:         dynamicObservationTargetDiscovered,
 				Decision:           dynamicObservationDecisionDenied,
 				ReasonCode:         reasonCase.reason,
+				RedirectStatus:     0,
 			})
 		}
 		observations, err := reopened.ListDynamicObservations(1)
@@ -449,8 +612,10 @@ func TestDynamicObservationMigrationEmptyAndV17IsIdempotent(t *testing.T) {
 				SiteID:             1,
 				CanonicalAuthority: fmt.Sprintf("https://structured-%d.example.com:443", index),
 				Source:             source,
+				TargetKind:         dynamicObservationTargetDiscovered,
 				Decision:           dynamicObservationDecisionAllowed,
 				ReasonCode:         dynamicObservationReasonCandidateAllowed,
+				RedirectStatus:     0,
 			})
 		}
 		observations, err := db.ListDynamicObservations(1)
@@ -464,7 +629,7 @@ func TestDynamicObservationMigrationEmptyAndV17IsIdempotent(t *testing.T) {
 }
 
 func TestDynamicObservationMigrationRejectsMalformedCoreSchema(t *testing.T) {
-	for _, variant := range []string{"extra privacy-bearing column", "wrong core index"} {
+	for _, variant := range []string{"extra privacy-bearing column", "wrong core index", "recognized v1.9 with extra column", "recognized previous route schema with extra column"} {
 		t.Run(variant, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "malformed.db")
 			createMalformedDynamicObservationFixture(t, path, variant)
@@ -474,6 +639,94 @@ func TestDynamicObservationMigrationRejectsMalformedCoreSchema(t *testing.T) {
 				t.Fatal("startup accepted malformed dynamic observation schema")
 			}
 		})
+	}
+}
+
+func TestDynamicCapabilityIssuerObservationTargetKindsUseCanonicalAuthority(t *testing.T) {
+	db, _ := openDynamicObservationTestDB(t)
+	site := createDynamicObservationTestSite(t, db, "structured-target-kinds")
+	issuer := &dynamicCapabilityIssuer{
+		siteID:           site.ID,
+		database:         db,
+		primaryAuthority: "https://primary.example.com",
+		configuredAuthorities: map[string]bool{
+			"https://primary.example.com":         true,
+			"https://configured.example.com:8443": true,
+		},
+	}
+	cases := []struct {
+		authority  string
+		source     string
+		targetKind string
+	}{
+		{authority: "https://primary.example.com:443", source: dynamicObservationSourcePlaybackInfo, targetKind: dynamicObservationTargetSameAuthority},
+		{authority: "https://configured.example.com:8443", source: dynamicObservationSourceHLS, targetKind: dynamicObservationTargetConfigured},
+		{authority: "https://dynamic.example.com:443", source: dynamicObservationSourceDASH, targetKind: dynamicObservationTargetDiscovered},
+	}
+	expected := make(map[string]struct {
+		source     string
+		targetKind string
+	}, len(cases))
+	for _, observationCase := range cases {
+		issuer.observe(observationCase.source, dynamicObservationDecisionAllowed, dynamicObservationReasonCandidateAllowed, observationCase.authority)
+		expected[observationCase.authority] = struct {
+			source     string
+			targetKind string
+		}{source: observationCase.source, targetKind: observationCase.targetKind}
+	}
+	observations, err := db.ListDynamicObservations(site.ID)
+	if err != nil {
+		t.Fatalf("list structured target-kind observations: %v", err)
+	}
+	if len(observations) != len(cases) {
+		t.Fatalf("structured target-kind observations=%d, want %d: %#v", len(observations), len(cases), observations)
+	}
+	for _, observation := range observations {
+		want, ok := expected[observation.CanonicalAuthority]
+		if !ok || observation.Source != want.source || observation.TargetKind != want.targetKind || observation.RedirectStatus != 0 {
+			t.Fatalf("structured target-kind observation=%#v, want=%#v present=%t", observation, want, ok)
+		}
+	}
+}
+
+func TestDynamicObservationStageMappingIsExhaustive(t *testing.T) {
+	expected := map[string]string{
+		dynamicObservationReasonRedirectAllowed:          dynamicObservationStageResponse,
+		dynamicObservationReasonUnsupportedStatus:        dynamicObservationStageResponse,
+		dynamicObservationReasonResponseFailure:          dynamicObservationStageResponse,
+		dynamicObservationReasonInvalidLocation:          dynamicObservationStageLocation,
+		dynamicObservationReasonRedirectLoop:             dynamicObservationStageLocation,
+		dynamicObservationReasonHopLimit:                 dynamicObservationStageLocation,
+		dynamicObservationReasonCandidateAllowed:         dynamicObservationStagePolicy,
+		dynamicObservationReasonSchemeDenied:             dynamicObservationStagePolicy,
+		dynamicObservationReasonPortDenied:               dynamicObservationStagePolicy,
+		dynamicObservationReasonDomainDenied:             dynamicObservationStagePolicy,
+		dynamicObservationReasonHTTPSDowngradeDenied:     dynamicObservationStagePolicy,
+		dynamicObservationReasonSelfTarget:               dynamicObservationStagePolicy,
+		dynamicObservationReasonPlaybackInfoDenied:       dynamicObservationStagePolicy,
+		dynamicObservationReasonHLSFeatureDenied:         dynamicObservationStagePolicy,
+		dynamicObservationReasonDASHFeatureDenied:        dynamicObservationStagePolicy,
+		dynamicObservationReasonDNSFailure:               dynamicObservationStageResolve,
+		dynamicObservationReasonAddressDenied:            dynamicObservationStageResolve,
+		dynamicObservationReasonDialFailure:              dynamicObservationStageConnect,
+		dynamicObservationReasonTLSFailure:               dynamicObservationStageConnect,
+		dynamicObservationReasonCapacityLimit:            dynamicObservationStageCapacity,
+		dynamicObservationReasonRateLimit:                dynamicObservationStageCapacity,
+		dynamicObservationReasonParseFailure:             dynamicObservationStageParse,
+		dynamicObservationReasonRequestUnclassified:      dynamicObservationStageParse,
+		dynamicObservationReasonStructuredBodyLimit:      dynamicObservationStageParse,
+		dynamicObservationReasonRedirectBodyReplayDenied: dynamicObservationStageParse,
+		dynamicObservationReasonCapabilityInvalid:        dynamicObservationStageCapability,
+		dynamicObservationReasonCapabilityExpired:        dynamicObservationStageCapability,
+		dynamicObservationReasonRuntimeUnavailable:       dynamicObservationStageRuntime,
+	}
+	for reasonCode, wantStage := range expected {
+		if gotStage, ok := dynamicObservationStageForReason(reasonCode); !ok || gotStage != wantStage {
+			t.Fatalf("stage for %q=%q/%t, want %q/true", reasonCode, gotStage, ok, wantStage)
+		}
+	}
+	if stage, ok := dynamicObservationStageForReason("free_text_stage_secret"); ok || stage != "" {
+		t.Fatalf("arbitrary reason derived stage=%q/%t", stage, ok)
 	}
 }
 
@@ -509,25 +762,32 @@ func TestDynamicObservationEventsAreFiniteAndPrivacySafe(t *testing.T) {
 			SiteID:             site.ID,
 			CanonicalAuthority: fmt.Sprintf("https://denied-%02d.example.com:443", i),
 			Source:             dynamicObservationSourceRedirect,
+			TargetKind:         dynamicObservationTargetDiscovered,
 			Decision:           dynamicObservationDecisionDenied,
 			ReasonCode:         reason,
+			RedirectStatus:     0,
 		})
 	}
+	structuredTargetKinds := []string{dynamicObservationTargetSameAuthority, dynamicObservationTargetConfigured, dynamicObservationTargetDiscovered}
 	for index, source := range []string{dynamicObservationSourcePlaybackInfo, dynamicObservationSourceHLS, dynamicObservationSourceDASH} {
 		valid = append(valid,
 			dynamicObservationEvent{
 				SiteID:             site.ID,
 				CanonicalAuthority: fmt.Sprintf("https://allowed-structured-%d.example.com:443", index),
 				Source:             source,
+				TargetKind:         structuredTargetKinds[index],
 				Decision:           dynamicObservationDecisionAllowed,
 				ReasonCode:         dynamicObservationReasonCandidateAllowed,
+				RedirectStatus:     0,
 			},
 			dynamicObservationEvent{
 				SiteID:             site.ID,
 				CanonicalAuthority: fmt.Sprintf("https://denied-structured-%d.example.com:443", index),
 				Source:             source,
+				TargetKind:         structuredTargetKinds[index],
 				Decision:           dynamicObservationDecisionDenied,
 				ReasonCode:         dynamicObservationReasonParseFailure,
+				RedirectStatus:     0,
 			},
 		)
 	}
@@ -536,8 +796,10 @@ func TestDynamicObservationEventsAreFiniteAndPrivacySafe(t *testing.T) {
 			SiteID:             site.ID,
 			CanonicalAuthority: fmt.Sprintf("https://extreme-denied-%02d.example.com:443", index),
 			Source:             reasonCase.source,
+			TargetKind:         dynamicObservationTargetDiscovered,
 			Decision:           dynamicObservationDecisionDenied,
 			ReasonCode:         reasonCase.reason,
+			RedirectStatus:     0,
 		})
 	}
 	for _, event := range valid {
@@ -545,20 +807,24 @@ func TestDynamicObservationEventsAreFiniteAndPrivacySafe(t *testing.T) {
 	}
 
 	invalid := []dynamicObservationEvent{
-		{SiteID: 0, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
-		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443/private-path-secret", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
-		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443?token=query-token-secret", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
-		{SiteID: site.ID, CanonicalAuthority: "https://user:password-secret@cdn.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
-		{SiteID: site.ID, CanonicalAuthority: "https://CDN.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
-		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
-		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:0443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
-		{SiteID: site.ID, CanonicalAuthority: " https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
-		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: "playback", Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
-		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, Decision: "observed", ReasonCode: dynamicObservationReasonRedirectAllowed},
-		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonDNSFailure},
-		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionDenied, ReasonCode: dynamicObservationReasonRedirectAllowed},
-		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionDenied, ReasonCode: "request_body_secret"},
-		{SiteID: site.ID, CanonicalAuthority: "https://" + strings.Repeat("a", dynamicObservationMaxAuthorityBytes) + ":443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: 0, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443/private-path-secret", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443?token=query-token-secret", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://user:password-secret@cdn.example.com:443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://CDN.example.com:443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:0443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: " https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: "playback", TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, TargetKind: "manual_secret", Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: "observed", ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonDNSFailure},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionDenied, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionDenied, ReasonCode: "request_body_secret"},
+		{SiteID: site.ID, CanonicalAuthority: "https://" + strings.Repeat("a", dynamicObservationMaxAuthorityBytes) + ":443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed, RedirectStatus: 299},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed, RedirectStatus: 400},
+		{SiteID: site.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: dynamicObservationSourceHLS, TargetKind: dynamicObservationTargetConfigured, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonCandidateAllowed, RedirectStatus: 302},
 	}
 	for _, event := range invalid {
 		db.EnqueueDynamicObservation(event)
@@ -577,10 +843,11 @@ func TestDynamicObservationEventsAreFiniteAndPrivacySafe(t *testing.T) {
 
 	expected := make(map[string]bool, len(valid))
 	for _, event := range valid {
-		expected[event.Source+"\x00"+event.Decision+"\x00"+event.ReasonCode] = true
+		stage, _ := dynamicObservationStageForReason(event.ReasonCode)
+		expected[event.Source+"\x00"+event.TargetKind+"\x00"+stage+"\x00"+event.Decision+"\x00"+event.ReasonCode+"\x00"+fmt.Sprint(event.RedirectStatus)] = true
 	}
 	for _, observation := range observations {
-		key := observation.Source + "\x00" + observation.Decision + "\x00" + observation.ReasonCode
+		key := observation.Source + "\x00" + observation.TargetKind + "\x00" + observation.Stage + "\x00" + observation.Decision + "\x00" + observation.ReasonCode + "\x00" + fmt.Sprint(observation.RedirectStatus)
 		if observation.SiteID != site.ID || !expected[key] || observation.Count != 1 {
 			t.Fatalf("unexpected stored observation=%#v", observation)
 		}
@@ -589,10 +856,22 @@ func TestDynamicObservationEventsAreFiniteAndPrivacySafe(t *testing.T) {
 	if len(expected) != 0 {
 		t.Fatalf("missing finite observation tuples=%v", expected)
 	}
+	now := time.Now().UnixMilli()
+	if _, err := db.db.Exec(dynamicObservationTestInsertSQL, site.ID, "https://stage-reject.example.com:443", dynamicObservationSourceRedirect, dynamicObservationTargetDiscovered, "free_text_stage_secret", dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, 302, now, now, 1); err == nil {
+		t.Fatal("schema accepted arbitrary observation stage")
+	}
+	if _, err := db.db.Exec(dynamicObservationTestInsertSQL, site.ID, "https://status-reject.example.com:443", dynamicObservationSourceRedirect, dynamicObservationTargetDiscovered, dynamicObservationStageResponse, dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, 418, now, now, 1); err == nil {
+		t.Fatal("schema accepted a non-3xx redirect status")
+	}
+	if _, err := db.db.Exec(dynamicObservationTestInsertSQL, site.ID, "https://structured-status-reject.example.com:443", dynamicObservationSourceHLS, dynamicObservationTargetConfigured, dynamicObservationStagePolicy, dynamicObservationDecisionAllowed, dynamicObservationReasonCandidateAllowed, 302, now, now, 1); err == nil {
+		t.Fatal("schema accepted redirect status for a non-redirect source")
+	}
 	var leaked int
 	if err := db.db.QueryRow(`
 		SELECT COUNT(*) FROM dynamic_observations
 		WHERE instr(canonical_authority, 'secret') > 0
+		   OR instr(target_kind, 'secret') > 0
+		   OR instr(stage, 'secret') > 0
 		   OR instr(reason_code, 'secret') > 0`).Scan(&leaked); err != nil {
 		t.Fatalf("inspect privacy-safe rows: %v", err)
 	}
@@ -651,7 +930,7 @@ func TestDynamicObservationWriterAggregatesBatches(t *testing.T) {
 	base := time.Now().UnixMilli()
 	batch := make([]queuedDynamicObservation, dynamicObservationBatchSize)
 	for i := range batch {
-		batch[i] = queuedDynamicObservation{event: event, observedAtMS: base + int64(i)}
+		batch[i] = queuedDynamicObservation{event: event, stage: dynamicObservationStageResponse, observedAtMS: base + int64(i)}
 	}
 	skipped, err := db.writeDynamicObservationBatch(batch)
 	if err != nil || skipped != 0 {
@@ -661,8 +940,8 @@ func TestDynamicObservationWriterAggregatesBatches(t *testing.T) {
 		t.Fatalf("full duplicate batch executed %d row writes, want 1", writes)
 	}
 	second := []queuedDynamicObservation{
-		{event: event, observedAtMS: base - 10},
-		{event: event, observedAtMS: base + 1000},
+		{event: event, stage: dynamicObservationStageResponse, observedAtMS: base - 10},
+		{event: event, stage: dynamicObservationStageResponse, observedAtMS: base + 1000},
 	}
 	skipped, err = db.writeDynamicObservationBatch(second)
 	if err != nil || skipped != 0 {
@@ -685,7 +964,43 @@ func TestDynamicObservationWriterAggregatesBatches(t *testing.T) {
 	}
 }
 
-func TestDynamicObservationPruningRetentionAndGlobalLimit(t *testing.T) {
+func TestDynamicObservationAggregationSeparatesRouteDimensions(t *testing.T) {
+	db, _ := openDynamicObservationTestDB(t)
+	site := createDynamicObservationTestSite(t, db, "route-dimension-aggregation")
+	authority := "https://dimension.example.com:443"
+	events := []dynamicObservationEvent{
+		{SiteID: site.ID, CanonicalAuthority: authority, Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed, RedirectStatus: 301},
+		{SiteID: site.ID, CanonicalAuthority: authority, Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed, RedirectStatus: 302},
+		{SiteID: site.ID, CanonicalAuthority: authority, Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetConfigured, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed, RedirectStatus: 301},
+		{SiteID: site.ID, CanonicalAuthority: authority, Source: dynamicObservationSourceRedirect, TargetKind: dynamicObservationTargetDiscovered, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonCandidateAllowed, RedirectStatus: 0},
+	}
+	for index, event := range events {
+		db.EnqueueDynamicObservation(event)
+		if index == 0 {
+			db.EnqueueDynamicObservation(event)
+		}
+	}
+	observations, err := db.ListDynamicObservations(site.ID)
+	if err != nil {
+		t.Fatalf("list route dimension observations: %v", err)
+	}
+	if len(observations) != len(events) {
+		t.Fatalf("route dimension rows=%d, want %d: %#v", len(observations), len(events), observations)
+	}
+	seen := make(map[string]int64, len(observations))
+	for _, observation := range observations {
+		key := observation.TargetKind + "\x00" + observation.Stage + "\x00" + fmt.Sprint(observation.RedirectStatus)
+		seen[key] = observation.Count
+	}
+	if seen[dynamicObservationTargetDiscovered+"\x00"+dynamicObservationStageResponse+"\x00301"] != 2 ||
+		seen[dynamicObservationTargetDiscovered+"\x00"+dynamicObservationStageResponse+"\x00302"] != 1 ||
+		seen[dynamicObservationTargetConfigured+"\x00"+dynamicObservationStageResponse+"\x00301"] != 1 ||
+		seen[dynamicObservationTargetDiscovered+"\x00"+dynamicObservationStagePolicy+"\x000"] != 1 {
+		t.Fatalf("route dimension aggregates=%v", seen)
+	}
+}
+
+func TestDynamicObservationPruningRetentionPerSiteAndGlobalLimits(t *testing.T) {
 	fixedNow := time.UnixMilli(2_000_000_000_000)
 
 	t.Run("thirty day boundary", func(t *testing.T) {
@@ -704,19 +1019,18 @@ func TestDynamicObservationPruningRetentionAndGlobalLimit(t *testing.T) {
 			{authority: "https://boundary.example.com:443", seen: cutoff},
 			{authority: "https://recent.example.com:443", seen: fixedNow.UnixMilli()},
 		} {
-			if _, err := tx.Exec(dynamicObservationTestInsertSQL, site.ID, row.authority, dynamicObservationSourceRedirect, dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, row.seen, row.seen, 1); err != nil {
+			if _, err := tx.Exec(dynamicObservationTestInsertSQL, site.ID, row.authority, dynamicObservationSourceRedirect, dynamicObservationTargetDiscovered, dynamicObservationStageResponse, dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, 0, row.seen, row.seen, 1); err != nil {
 				_ = tx.Rollback()
 				t.Fatalf("insert retention fixture: %v", err)
 			}
 		}
-		if err := pruneDynamicObservationsTx(tx, fixedNow); err != nil {
+		if err := pruneDynamicObservationRows(context.Background(), tx, fixedNow); err != nil {
 			_ = tx.Rollback()
 			t.Fatalf("prune retention fixture: %v", err)
 		}
 		if err := tx.Commit(); err != nil {
 			t.Fatalf("commit retention fixture: %v", err)
 		}
-
 		var total, expired, boundary int
 		if err := db.db.QueryRow(`
 			SELECT COUNT(*),
@@ -730,47 +1044,86 @@ func TestDynamicObservationPruningRetentionAndGlobalLimit(t *testing.T) {
 		}
 	})
 
-	t.Run("ten thousand newest rows", func(t *testing.T) {
+	t.Run("five hundred newest rows per site", func(t *testing.T) {
 		db, _ := openDynamicObservationTestDB(t)
-		site := createDynamicObservationTestSite(t, db, "limit-pruning")
+		site := createDynamicObservationTestSite(t, db, "per-site-pruning")
 		tx, err := db.db.Begin()
 		if err != nil {
-			t.Fatalf("begin row-limit fixture: %v", err)
+			t.Fatalf("begin per-site fixture: %v", err)
 		}
 		statement, err := tx.Prepare(dynamicObservationTestInsertSQL)
 		if err != nil {
 			_ = tx.Rollback()
-			t.Fatalf("prepare row-limit fixture: %v", err)
+			t.Fatalf("prepare per-site fixture: %v", err)
 		}
 		base := fixedNow.Add(-time.Hour).UnixMilli()
-		for i := 0; i < dynamicObservationGlobalRowLimit+2; i++ {
-			authority := fmt.Sprintf("https://row-%05d.example.com:443", i)
+		for i := range dynamicObservationPerSiteRowLimit + 2 {
+			authority := fmt.Sprintf("https://site-row-%05d.example.com:443", i)
 			seen := base + int64(i)
-			if _, err := statement.Exec(site.ID, authority, dynamicObservationSourceRedirect, dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, seen, seen, 1); err != nil {
+			if _, err := statement.Exec(site.ID, authority, dynamicObservationSourceRedirect, dynamicObservationTargetDiscovered, dynamicObservationStageResponse, dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, 0, seen, seen, 1); err != nil {
 				_ = statement.Close()
 				_ = tx.Rollback()
-				t.Fatalf("insert row-limit fixture %d: %v", i, err)
+				t.Fatalf("insert per-site fixture %d: %v", i, err)
 			}
 		}
-		if err := statement.Close(); err != nil {
+		_ = statement.Close()
+		if err := pruneDynamicObservationRows(context.Background(), tx, fixedNow); err != nil {
 			_ = tx.Rollback()
-			t.Fatalf("close row-limit fixture: %v", err)
-		}
-		if err := pruneDynamicObservationsTx(tx, fixedNow); err != nil {
-			_ = tx.Rollback()
-			t.Fatalf("prune row-limit fixture: %v", err)
+			t.Fatalf("prune per-site fixture: %v", err)
 		}
 		if err := tx.Commit(); err != nil {
-			t.Fatalf("commit row-limit fixture: %v", err)
+			t.Fatalf("commit per-site fixture: %v", err)
 		}
+		var total int
+		var oldest, newest int64
+		if err := db.db.QueryRow("SELECT COUNT(*), MIN(last_seen_ms), MAX(last_seen_ms) FROM dynamic_observations WHERE site_id=?", site.ID).Scan(&total, &oldest, &newest); err != nil {
+			t.Fatalf("inspect per-site limit: %v", err)
+		}
+		if total != dynamicObservationPerSiteRowLimit || oldest != base+2 || newest != base+int64(dynamicObservationPerSiteRowLimit+1) {
+			t.Fatalf("per-site limit total=%d oldest=%d newest=%d", total, oldest, newest)
+		}
+	})
 
+	t.Run("ten thousand newest rows globally", func(t *testing.T) {
+		db, _ := openDynamicObservationTestDB(t)
+		siteIDs := make([]int64, 21)
+		for i := range siteIDs {
+			siteIDs[i] = createDynamicObservationTestSite(t, db, fmt.Sprintf("global-pruning-%02d", i)).ID
+		}
+		tx, err := db.db.Begin()
+		if err != nil {
+			t.Fatalf("begin global fixture: %v", err)
+		}
+		statement, err := tx.Prepare(dynamicObservationTestInsertSQL)
+		if err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("prepare global fixture: %v", err)
+		}
+		base := fixedNow.Add(-time.Hour).UnixMilli()
+		for i := range dynamicObservationGlobalRowLimit + 2 {
+			authority := fmt.Sprintf("https://global-row-%05d.example.com:443", i)
+			seen := base + int64(i)
+			if _, err := statement.Exec(siteIDs[i%len(siteIDs)], authority, dynamicObservationSourceRedirect, dynamicObservationTargetDiscovered, dynamicObservationStageResponse, dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, 0, seen, seen, 1); err != nil {
+				_ = statement.Close()
+				_ = tx.Rollback()
+				t.Fatalf("insert global fixture %d: %v", i, err)
+			}
+		}
+		_ = statement.Close()
+		if err := pruneDynamicObservationRows(context.Background(), tx, fixedNow); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("prune global fixture: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit global fixture: %v", err)
+		}
 		var total int
 		var oldest, newest int64
 		if err := db.db.QueryRow("SELECT COUNT(*), MIN(last_seen_ms), MAX(last_seen_ms) FROM dynamic_observations").Scan(&total, &oldest, &newest); err != nil {
-			t.Fatalf("inspect row-limit result: %v", err)
+			t.Fatalf("inspect global limit: %v", err)
 		}
 		if total != dynamicObservationGlobalRowLimit || oldest != base+2 || newest != base+int64(dynamicObservationGlobalRowLimit+1) {
-			t.Fatalf("row-limit result total=%d oldest=%d newest=%d", total, oldest, newest)
+			t.Fatalf("global limit total=%d oldest=%d newest=%d", total, oldest, newest)
 		}
 	})
 }
@@ -821,7 +1174,7 @@ func TestDynamicObservationCloseFlushesAcceptedEvents(t *testing.T) {
 	site := createDynamicObservationTestSite(t, db, "close-flush")
 	event := allowedDynamicObservationTestEvent(site.ID, "https://close.example.com:443")
 	accepted := dynamicObservationBatchSize + 7
-	for i := 0; i < accepted; i++ {
+	for range accepted {
 		db.EnqueueDynamicObservation(event)
 	}
 	db.Close()
@@ -844,7 +1197,7 @@ func TestDynamicObservationClearIsAnOrderedDeleteBarrier(t *testing.T) {
 	db, _ := openDynamicObservationTestDB(t)
 	site := createDynamicObservationTestSite(t, db, "clear-barrier")
 	event := allowedDynamicObservationTestEvent(site.ID, "https://clear.example.com:443")
-	for i := 0; i < dynamicObservationBatchSize*2+1; i++ {
+	for range dynamicObservationBatchSize*2 + 1 {
 		db.EnqueueDynamicObservation(event)
 	}
 	if err := db.ClearDynamicObservations(site.ID); err != nil {
@@ -875,7 +1228,7 @@ func TestDynamicObservationSiteDeleteCleansChildrenAndDropsOrphans(t *testing.T)
 		t.Fatalf("disable foreign-key cascade for cleanup proof: %v", err)
 	}
 	now := time.Now().UnixMilli()
-	if _, err := db.db.Exec(dynamicObservationTestInsertSQL, site.ID, "https://stored-child.example.com:443", dynamicObservationSourceRedirect, dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, now, now, 1); err != nil {
+	if _, err := db.db.Exec(dynamicObservationTestInsertSQL, site.ID, "https://stored-child.example.com:443", dynamicObservationSourceRedirect, dynamicObservationTargetDiscovered, dynamicObservationStageResponse, dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, 0, now, now, 1); err != nil {
 		t.Fatalf("insert explicit child fixture: %v", err)
 	}
 	db.EnqueueDynamicObservation(allowedDynamicObservationTestEvent(site.ID, "https://queued-child.example.com:443"))
@@ -932,8 +1285,11 @@ func TestDynamicObservationAPIAuthAndExactPrivateEnvelope(t *testing.T) {
 			SiteID:             site.ID,
 			CanonicalAuthority: "https://cdn.example.com:443",
 			Source:             dynamicObservationSourceRedirect,
+			TargetKind:         dynamicObservationTargetDiscovered,
+			Stage:              dynamicObservationStageResponse,
 			Decision:           dynamicObservationDecisionAllowed,
 			ReasonCode:         dynamicObservationReasonRedirectAllowed,
+			RedirectStatus:     0,
 			Count:              1,
 		},
 	}
@@ -944,15 +1300,20 @@ func TestDynamicObservationAPIAuthAndExactPrivateEnvelope(t *testing.T) {
 			SiteID:             site.ID,
 			CanonicalAuthority: authority,
 			Source:             reasonCase.source,
+			TargetKind:         dynamicObservationTargetDiscovered,
 			Decision:           dynamicObservationDecisionDenied,
 			ReasonCode:         reasonCase.reason,
+			RedirectStatus:     0,
 		})
 		apiExpected[authority] = DynamicObservation{
 			SiteID:             site.ID,
 			CanonicalAuthority: authority,
 			Source:             reasonCase.source,
+			TargetKind:         dynamicObservationTargetDiscovered,
+			Stage:              func() string { stage, _ := dynamicObservationStageForReason(reasonCase.reason); return stage }(),
 			Decision:           dynamicObservationDecisionDenied,
 			ReasonCode:         reasonCase.reason,
+			RedirectStatus:     0,
 			Count:              1,
 		}
 	}
@@ -960,6 +1321,19 @@ func TestDynamicObservationAPIAuthAndExactPrivateEnvelope(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
 	endpoint := fmt.Sprintf("http://panel.example.com/api/sites/%d/dynamic-observations", site.ID)
+	requireMetadata := func(envelope map[string]json.RawMessage) {
+		t.Helper()
+		for field, want := range map[string]int{
+			"retention_days":     dynamicObservationRetentionDays,
+			"per_site_row_limit": dynamicObservationPerSiteRowLimit,
+			"global_row_limit":   dynamicObservationGlobalRowLimit,
+		} {
+			var got int
+			if err := json.Unmarshal(envelope[field], &got); err != nil || got != want {
+				t.Fatalf("%s=%d err=%v, want %d", field, got, err, want)
+			}
+		}
+	}
 
 	for _, method := range []string{http.MethodGet, http.MethodDelete} {
 		secret := "unauthenticated-" + strings.ToLower(method) + "-body-secret"
@@ -1003,10 +1377,11 @@ func TestDynamicObservationAPIAuthAndExactPrivateEnvelope(t *testing.T) {
 	if getResponse.Header().Get("Cache-Control") != "no-store" || getResponse.Header().Get("Content-Type") != "application/json" {
 		t.Fatalf("GET headers Cache-Control=%q Content-Type=%q", getResponse.Header().Get("Cache-Control"), getResponse.Header().Get("Content-Type"))
 	}
-	getEnvelope := requireExactJSONFields(t, getResponse.Body.Bytes(), "observations", "dropped_observations")
+	getEnvelope := requireExactJSONFields(t, getResponse.Body.Bytes(), "observations", "dropped_observations_global", "retention_days", "per_site_row_limit", "global_row_limit")
+	requireMetadata(getEnvelope)
 	var getDropped uint64
-	if err := json.Unmarshal(getEnvelope["dropped_observations"], &getDropped); err != nil || getDropped != 0 {
-		t.Fatalf("GET dropped_observations=%d err=%v", getDropped, err)
+	if err := json.Unmarshal(getEnvelope["dropped_observations_global"], &getDropped); err != nil || getDropped != 0 {
+		t.Fatalf("GET dropped_observations_global=%d err=%v", getDropped, err)
 	}
 	var observationItems []json.RawMessage
 	if err := json.Unmarshal(getEnvelope["observations"], &observationItems); err != nil {
@@ -1023,8 +1398,11 @@ func TestDynamicObservationAPIAuthAndExactPrivateEnvelope(t *testing.T) {
 			"site_id",
 			"canonical_authority",
 			"source",
+			"target_kind",
+			"stage",
 			"decision",
 			"reason_code",
+			"redirect_status",
 			"first_seen_ms",
 			"last_seen_ms",
 			"count",
@@ -1034,7 +1412,7 @@ func TestDynamicObservationAPIAuthAndExactPrivateEnvelope(t *testing.T) {
 			t.Fatalf("decode GET observation: %v", err)
 		}
 		want, ok := apiExpected[observation.CanonicalAuthority]
-		if !ok || observation.SiteID != want.SiteID || observation.Source != want.Source || observation.Decision != want.Decision || observation.ReasonCode != want.ReasonCode || observation.Count != want.Count || observation.FirstSeenMS < 0 || observation.LastSeenMS < observation.FirstSeenMS {
+		if !ok || observation.SiteID != want.SiteID || observation.Source != want.Source || observation.TargetKind != want.TargetKind || observation.Stage != want.Stage || observation.Decision != want.Decision || observation.ReasonCode != want.ReasonCode || observation.RedirectStatus != want.RedirectStatus || observation.Count != want.Count || observation.FirstSeenMS < 0 || observation.LastSeenMS < observation.FirstSeenMS {
 			t.Fatalf("GET observation=%#v, want=%#v present=%t", observation, want, ok)
 		}
 		if seenAPIObservations[observation.CanonicalAuthority] {
@@ -1059,13 +1437,14 @@ func TestDynamicObservationAPIAuthAndExactPrivateEnvelope(t *testing.T) {
 	if deleteResponse.Header().Get("Cache-Control") != "no-store" || deleteResponse.Header().Get("Content-Type") != "application/json" {
 		t.Fatalf("DELETE headers Cache-Control=%q Content-Type=%q", deleteResponse.Header().Get("Cache-Control"), deleteResponse.Header().Get("Content-Type"))
 	}
-	deleteEnvelope := requireExactJSONFields(t, deleteResponse.Body.Bytes(), "observations", "dropped_observations")
+	deleteEnvelope := requireExactJSONFields(t, deleteResponse.Body.Bytes(), "observations", "dropped_observations_global", "retention_days", "per_site_row_limit", "global_row_limit")
+	requireMetadata(deleteEnvelope)
 	if strings.TrimSpace(string(deleteEnvelope["observations"])) != "[]" {
 		t.Fatalf("DELETE observations=%s, want []", deleteEnvelope["observations"])
 	}
 	var deleteDropped uint64
-	if err := json.Unmarshal(deleteEnvelope["dropped_observations"], &deleteDropped); err != nil || deleteDropped != 0 {
-		t.Fatalf("DELETE dropped_observations=%d err=%v", deleteDropped, err)
+	if err := json.Unmarshal(deleteEnvelope["dropped_observations_global"], &deleteDropped); err != nil || deleteDropped != 0 {
+		t.Fatalf("DELETE dropped_observations_global=%d err=%v", deleteDropped, err)
 	}
 	requireNoObservationSecrets(t, deleteResponse.Body.Bytes(), token, "delete-query-secret", "delete-body-secret", "delete-header-secret", "site-url-secret", "site-query-secret")
 
@@ -1076,7 +1455,8 @@ func TestDynamicObservationAPIAuthAndExactPrivateEnvelope(t *testing.T) {
 	if verifyResponse.Code != http.StatusOK {
 		t.Fatalf("GET after DELETE status=%d body=%s", verifyResponse.Code, verifyResponse.Body.String())
 	}
-	verifyEnvelope := requireExactJSONFields(t, verifyResponse.Body.Bytes(), "observations", "dropped_observations")
+	verifyEnvelope := requireExactJSONFields(t, verifyResponse.Body.Bytes(), "observations", "dropped_observations_global", "retention_days", "per_site_row_limit", "global_row_limit")
+	requireMetadata(verifyEnvelope)
 	if strings.TrimSpace(string(verifyEnvelope["observations"])) != "[]" {
 		t.Fatalf("GET after DELETE observations=%s, want []", verifyEnvelope["observations"])
 	}

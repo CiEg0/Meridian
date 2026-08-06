@@ -57,11 +57,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 安装完成后：
 
 1. 未配置域名时访问 `http://服务器IP:9090`；配置域名后访问对应的 HTTPS 地址。
-2. 输入管理员账号、12–72 字节的密码，以及安装时显示的初始化令牌。
+2. 输入 1–64 个 UTF-8 字节的管理员账号、12–72 个 UTF-8 字节的密码并再次确认，以及安装时显示的初始化令牌。
 3. 创建站点并选择入口模式、回源和播放策略。
 
 > [!IMPORTANT]
-> `SETUP_TOKEN` 等同于首次管理员创建权限。安装器将其保存在权限受限的 `/opt/meridian/.env`，请同时存入密码管理器，不要放进 Issue、日志或截图。
+> `SETUP_TOKEN` 等同于首次管理员创建权限。安装器将其保存在权限受限的 `/opt/meridian/.env`，新生成时只显示一次；若初始化仍待完成且安装器提示令牌已存在，root 可从该文件恢复。请同时存入密码管理器，不要放进 Issue、日志或截图。管理页面不会读取或返回服务端令牌。
 
 <details>
 <summary><strong>常用管理命令</strong></summary>
@@ -250,6 +250,8 @@ systemd 部署优先使用安装器的 `password` 操作；它会先备份数据
 
 “解析 PlaybackInfo”可以单独关闭；30x 发现始终保留，Compatible/Extreme 的 HLS/DASH 也始终保留。Safe 的空域名规则允许具有受识别公共后缀的公网 DNS 主机；配置 `exact` / `suffix` 后会收窄为规则并集。
 
+手工“重定向跟随”独立于自动发现 Profile：对站点数据面的非 Upgrade GET/HEAD 处理 301/302/303/307/308，最多跟随 5 跳，每一跳只能命中管理员精确配置的播放回源 authority；因此可使用私网、HTTP 或非标准端口的显式目标，而不会扩大自动发现范围。跨 authority 仍清除 Cookie、Authorization、Emby token、固定上游 Header 和转发头；CONNECT、WebSocket/Upgrade、保留 capability 路径、POST/PUT/DELETE 和请求正文不会跟随。
+
 无论选择哪一档：
 
 - 私网、回环、链路本地、CGNAT、metadata 和已知自身目标都会被拒绝。
@@ -259,6 +261,8 @@ systemd 部署优先使用安装器的 `password` 操作；它会先备份数据
 - capability 是 bearer；第三方 CDN、负载均衡器和 Nginx 必须对该路径脱敏，不能记录完整 URL。
 
 完整的协议范围、资源上限、Header 规则、SSRF 边界和日志要求见 [SECURITY.md](SECURITY.md)。
+
+站点编辑页的“播放路由观察记录”通过有界异步队列聚合同权威、手工配置和自动发现目标的有限诊断信息，包括处理阶段、3xx 状态、首次/最近时间与次数；不保存完整 URL、路径、查询参数、令牌、Header 或正文。记录保留 30 天，每站点最多 500 条、全局最多 10,000 条，时间统一按 `Asia/Shanghai` 显示，SQLite/API 仍使用标准 epoch/UTC。
 
 ### UA 与固定 Header
 

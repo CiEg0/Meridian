@@ -131,6 +131,25 @@ test('API timeline helper uses the exact minute endpoint and default range', asy
   assert.deepEqual(calls, ['/api/traffic/7/timeline?minutes=360', '/api/traffic/8/timeline?minutes=1440']);
 });
 
+test('traffic point, detail, chart, and ARIA times are fixed to Asia/Shanghai', async () => {
+  const timestamp = Math.floor(Date.parse('2026-08-06T13:04:31.215Z') / 1000);
+  const h = harness(async url => String(url) === '/api/sites'
+    ? okJson([{ id: 1, name: 'Ready' }])
+    : okJson([bucket(timestamp, 10, 20, 3)]));
+  vm.runInContext('Date.prototype.toLocaleString = () => "BROWSER-LOCAL-TIME"', h.sandbox);
+  vm.runInContext('renderTraffic()', h.sandbox);
+  await flushTraffic();
+
+  assert.equal(vm.runInContext(`formatTrafficMinute(${timestamp})`, h.sandbox), '2026-08-06 21:04');
+  assert.equal(vm.runInContext('formatTrafficMinute(NaN)', h.sandbox), '不可用');
+  assert.match(h.elements['page-traffic'].innerHTML, /时间（Asia\/Shanghai）/);
+  vm.runInContext('selectTrafficPoint(0)', h.sandbox);
+  assert.match(h.elements['traffic-point-detail'].innerHTML, /<time class="traffic-detail-time">2026-08-06 21:04<\/time>/);
+  assert.match(h.elements.trafficChart.getAttribute('aria-valuetext'), /^2026-08-06 21:04，入站/);
+  assert.ok(h.elements.trafficChart.context.calls.some(call => call.name === 'fillText' && call.args[0] === '2026-08-06 21:04'));
+  assert.doesNotMatch(h.elements['traffic-point-detail'].innerHTML, /BROWSER-LOCAL-TIME|2026-08-06T13:04:31\.215Z/);
+});
+
 test('chart makes one request, keeps exact public buckets, and starts without a minute selection', async () => {
   const h = harness(async () => okJson([
     bucket(60, 100, 200, 1, { site_id: 99, client_ip: 'secret', name: 'private' }),

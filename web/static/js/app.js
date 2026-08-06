@@ -3,21 +3,31 @@
 
   const loginEl = document.getElementById('page-login');
   const shellEl = document.getElementById('app-shell');
+  const loginFormEl = document.getElementById('loginForm');
   const loginFooterEl = document.getElementById('login-footer');
   const loginButtonEl = document.getElementById('btn-login');
+  const usernameInputEl = document.getElementById('inp-username');
+  const usernameHelpEl = document.getElementById('admin-username-help');
   const passwordInputEl = document.getElementById('inp-password');
   const passwordHelpEl = document.getElementById('admin-password-help');
+  const confirmPasswordGroupEl = document.getElementById('confirm-password-group');
+  const confirmPasswordInputEl = document.getElementById('inp-confirm-password');
   const setupTokenGroupEl = document.getElementById('setup-token-group');
   const setupTokenInputEl = document.getElementById('inp-setup-token');
+  const setupTokenToggleEl = document.getElementById('btn-toggle-setup-token');
+  const authCheckStatusEl = document.getElementById('auth-check-status');
+  const authCheckMessageEl = document.getElementById('auth-check-message');
+  const authRetryButtonEl = document.getElementById('btn-auth-retry');
   let dashboardRefreshTimer = null;
   let appBootstrapped = false;
   let modalBackdropClosable = false;
   let modalPreviousFocus = null;
+  let authMode = 'checking';
+  let authSubmissionInFlight = false;
   let authStatus = {
     needs_setup: false,
     mode: 'single_admin',
     jwt_secret_ephemeral: false,
-    setup_token_required: false,
   };
 
   window.openModal = function(options) {
@@ -50,10 +60,53 @@
     if (e.key === 'Escape' && document.getElementById('modal-overlay').classList.contains('active')) closeModal();
   });
 
+  function setSetupTokenVisible(visible) {
+    setupTokenInputEl.type = visible ? 'text' : 'password';
+    setupTokenToggleEl.textContent = visible ? '隐藏' : '显示';
+    setupTokenToggleEl.setAttribute('aria-pressed', visible ? 'true' : 'false');
+    setupTokenToggleEl.setAttribute('aria-label', visible ? '隐藏初始化令牌' : '显示初始化令牌');
+  }
+
+  function setAuthChecking() {
+    authMode = 'checking';
+    loginFormEl.setAttribute('aria-busy', 'true');
+    loginButtonEl.disabled = true;
+    loginButtonEl.textContent = '正在检查...';
+    authCheckStatusEl.hidden = false;
+    authCheckStatusEl.classList.remove('error');
+    authCheckStatusEl.setAttribute('role', 'status');
+    authCheckMessageEl.textContent = '正在检查初始化状态...';
+    authRetryButtonEl.hidden = true;
+    authRetryButtonEl.disabled = true;
+    loginFooterEl.hidden = true;
+  }
+
+  function showAuthCheckError() {
+    authMode = 'error';
+    loginFormEl.setAttribute('aria-busy', 'false');
+    loginButtonEl.disabled = true;
+    loginButtonEl.textContent = '状态检查失败';
+    authCheckStatusEl.hidden = false;
+    authCheckStatusEl.classList.add('error');
+    authCheckStatusEl.setAttribute('role', 'alert');
+    authCheckMessageEl.textContent = '初始化状态检查失败，无法确定应登录还是创建管理员。请确认服务可用后重试。';
+    authRetryButtonEl.hidden = false;
+    authRetryButtonEl.disabled = false;
+    loginFooterEl.hidden = true;
+  }
+
   async function checkAuth() {
+    setAuthChecking();
     try {
       const res = await API.checkSetup();
-      authStatus = Object.assign({}, authStatus, res || {});
+      if (!res || typeof res.needs_setup !== 'boolean') {
+        throw new Error('invalid auth check response');
+      }
+      authStatus = {
+        needs_setup: res.needs_setup,
+        mode: typeof res.mode === 'string' ? res.mode : 'single_admin',
+        jwt_secret_ephemeral: !!res.jwt_secret_ephemeral,
+      };
       if (res.needs_setup) {
         showSetupMode();
         return;
@@ -63,24 +116,16 @@
         enterApp();
         return;
       }
+      showLoginMode();
     } catch (e) {
-      // Server not available, just show login
+      showAuthCheckError();
     }
-
-    showLoginMode();
   }
 
   function renderLoginFooter(isSetup) {
-    const lines = [];
-    if (authStatus.mode === 'single_admin') {
-      lines.push(isSetup
-        ? '当前为单管理员模式，请创建唯一的管理员账号。'
-        : '当前为单管理员模式。首次使用？<a href="#" id="link-register">创建管理员账号</a>');
-    } else {
-      lines.push(isSetup
-        ? '首次使用，请创建管理员账号。'
-        : '首次使用？<a href="#" id="link-register">创建管理员账号</a>');
-    }
+    const lines = [isSetup
+      ? '当前为单管理员模式，请创建唯一的管理员账号。'
+      : '当前为单管理员模式。'];
 
     if (authStatus.jwt_secret_ephemeral) {
       lines.push('<span class="login-note warn">当前未固定 JWT_SECRET，服务重启后需要重新登录。</span>');
@@ -90,28 +135,56 @@
   }
 
   function showSetupMode() {
-    loginButtonEl.textContent = '注册';
+    authMode = 'setup';
+    loginFormEl.setAttribute('aria-busy', 'false');
+    authCheckStatusEl.hidden = true;
+    loginButtonEl.textContent = '创建管理员';
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(true);
-    loginEl._isSetup = true;
+    loginFooterEl.hidden = false;
+    usernameHelpEl.hidden = false;
+    usernameInputEl.setAttribute('aria-describedby', 'admin-username-help');
     passwordHelpEl.hidden = false;
     passwordInputEl.autocomplete = 'new-password';
     passwordInputEl.setAttribute('aria-describedby', 'admin-password-help');
-    setupTokenGroupEl.hidden = !authStatus.setup_token_required;
-    setupTokenInputEl.required = !!authStatus.setup_token_required;
+    confirmPasswordGroupEl.hidden = false;
+    confirmPasswordInputEl.required = true;
+    setupTokenGroupEl.hidden = false;
+    setupTokenInputEl.required = true;
+    setSetupTokenVisible(false);
   }
 
   function showLoginMode() {
+    authMode = 'login';
+    loginFormEl.setAttribute('aria-busy', 'false');
+    authCheckStatusEl.hidden = true;
     loginButtonEl.textContent = '登录';
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(false);
-    loginEl._isSetup = false;
+    loginFooterEl.hidden = false;
+    usernameHelpEl.hidden = true;
+    usernameInputEl.removeAttribute('aria-describedby');
     passwordHelpEl.hidden = true;
     passwordInputEl.autocomplete = 'current-password';
     passwordInputEl.removeAttribute('aria-describedby');
+    confirmPasswordGroupEl.hidden = true;
+    confirmPasswordInputEl.required = false;
+    confirmPasswordInputEl.value = '';
     setupTokenGroupEl.hidden = true;
     setupTokenInputEl.required = false;
+    setupTokenInputEl.value = '';
+    setSetupTokenVisible(false);
   }
+
+  function setupUsernameValidationError(username) {
+    const length = utf8ByteLength(username);
+    return length < 1 || length > 64 ? '管理员用户名必须为 1-64 个 UTF-8 字节' : '';
+  }
+
+  authRetryButtonEl.addEventListener('click', checkAuth);
+  setupTokenToggleEl.addEventListener('click', function() {
+    setSetupTokenVisible(setupTokenInputEl.type === 'password');
+  });
 
   function startDashboardRefresh() {
     if (dashboardRefreshTimer) clearInterval(dashboardRefreshTimer);
@@ -132,36 +205,53 @@
     if (typeof stopTrafficRefresh === 'function') stopTrafficRefresh();
   }
 
-  document.getElementById('loginForm').addEventListener('submit', async function(e) {
+  loginFormEl.addEventListener('submit', async function(e) {
     e.preventDefault();
-    const username = document.getElementById('inp-username').value.trim();
-    const password = document.getElementById('inp-password').value;
-    const setupToken = setupTokenInputEl.value.trim();
-
-    if (!username || !password) {
-      Toast.error('请填写用户名和密码');
+    if (authSubmissionInFlight) return;
+    if (authMode !== 'setup' && authMode !== 'login') {
+      Toast.error('初始化状态尚未确认，请先重试');
       return;
     }
+    const submittingSetup = authMode === 'setup';
 
-    if (loginEl._isSetup) {
+    const username = usernameInputEl.value.trim();
+    const password = passwordInputEl.value;
+    const confirmPassword = confirmPasswordInputEl.value;
+    const setupToken = setupTokenInputEl.value.trim();
+
+    if (!submittingSetup) {
+      if (!username || !password) {
+        Toast.error('请填写用户名和密码');
+        return;
+      }
+    } else {
+      const usernameError = setupUsernameValidationError(username);
+      if (usernameError) {
+        Toast.error(usernameError);
+        return;
+      }
       const passwordError = adminPasswordValidationError(password);
       if (passwordError) {
         Toast.error(passwordError);
         return;
       }
+      if (password !== confirmPassword) {
+        Toast.error('两次输入的密码不一致');
+        return;
+      }
+      if (!setupToken) {
+        Toast.error('请填写初始化令牌');
+        return;
+      }
     }
 
-    if (loginEl._isSetup && authStatus.setup_token_required && !setupToken) {
-      Toast.error('请填写安装时显示或部署环境中设置的初始化令牌');
-      return;
-    }
-
+    authSubmissionInFlight = true;
     loginButtonEl.disabled = true;
     loginButtonEl.textContent = '处理中...';
 
     try {
       let res;
-      if (loginEl._isSetup) {
+      if (submittingSetup) {
         res = await API.setup(username, password, setupToken);
         Toast.success('管理员创建成功');
       } else {
@@ -169,22 +259,24 @@
         Toast.success('欢迎回来, ' + res.username + '!');
       }
       API.setSession(res);
-      document.getElementById('inp-password').value = '';
+      passwordInputEl.value = '';
+      confirmPasswordInputEl.value = '';
       setupTokenInputEl.value = '';
+      setSetupTokenVisible(false);
       enterApp();
     } catch (err) {
       Toast.error(err.message);
-      loginButtonEl.disabled = false;
-      loginButtonEl.textContent = loginEl._isSetup ? '注册' : '登录';
+      if (submittingSetup) {
+        await checkAuth();
+      } else {
+        loginButtonEl.disabled = false;
+        loginButtonEl.textContent = '登录';
+      }
+    } finally {
+      authSubmissionInFlight = false;
     }
   });
 
-  loginFooterEl.addEventListener('click', function(e) {
-    const registerLink = e.target.closest('#link-register');
-    if (!registerLink) return;
-    e.preventDefault();
-    showSetupMode();
-  });
 
   function enterApp() {
     loginEl.classList.add('hidden');
