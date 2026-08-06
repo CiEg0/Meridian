@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	xhtml "golang.org/x/net/html"
 	"meridian/web"
 )
 
@@ -1071,6 +1072,44 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	}
 	if strings.Contains(string(indexHTML), "fonts.googleapis.com") || strings.Contains(string(indexHTML), "fonts.gstatic.com") {
 		t.Error("index must not request fonts blocked by the Content-Security-Policy")
+	}
+}
+
+func TestLoginFeedbackAvailableBeforeAuthentication(t *testing.T) {
+	indexHTML, err := web.StaticFiles.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatalf("read embedded index HTML: %v", err)
+	}
+	document, err := xhtml.Parse(bytes.NewReader(indexHTML))
+	if err != nil {
+		t.Fatalf("parse embedded index HTML: %v", err)
+	}
+
+	var findByID func(*xhtml.Node, string) *xhtml.Node
+	findByID = func(node *xhtml.Node, id string) *xhtml.Node {
+		for _, attribute := range node.Attr {
+			if attribute.Key == "id" && attribute.Val == id {
+				return node
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			if match := findByID(child, id); match != nil {
+				return match
+			}
+		}
+		return nil
+	}
+
+	toastContainer := findByID(document, "toast-container")
+	appShell := findByID(document, "app-shell")
+	passwordHelp := findByID(document, "admin-password-help")
+	if toastContainer == nil || appShell == nil || passwordHelp == nil {
+		t.Fatalf("login feedback elements missing: toast=%v appShell=%v passwordHelp=%v", toastContainer != nil, appShell != nil, passwordHelp != nil)
+	}
+	for ancestor := toastContainer.Parent; ancestor != nil; ancestor = ancestor.Parent {
+		if ancestor == appShell {
+			t.Fatal("toast container must not be inside the app shell hidden before authentication")
+		}
 	}
 }
 

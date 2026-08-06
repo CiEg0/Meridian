@@ -5,6 +5,8 @@
   const shellEl = document.getElementById('app-shell');
   const loginFooterEl = document.getElementById('login-footer');
   const loginButtonEl = document.getElementById('btn-login');
+  const passwordInputEl = document.getElementById('inp-password');
+  const passwordHelpEl = document.getElementById('admin-password-help');
   const setupTokenGroupEl = document.getElementById('setup-token-group');
   const setupTokenInputEl = document.getElementById('inp-setup-token');
   let dashboardRefreshTimer = null;
@@ -92,6 +94,9 @@
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(true);
     loginEl._isSetup = true;
+    passwordHelpEl.hidden = false;
+    passwordInputEl.autocomplete = 'new-password';
+    passwordInputEl.setAttribute('aria-describedby', 'admin-password-help');
     setupTokenGroupEl.hidden = !authStatus.setup_token_required;
     setupTokenInputEl.required = !!authStatus.setup_token_required;
   }
@@ -101,6 +106,9 @@
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(false);
     loginEl._isSetup = false;
+    passwordHelpEl.hidden = true;
+    passwordInputEl.autocomplete = 'current-password';
+    passwordInputEl.removeAttribute('aria-describedby');
     setupTokenGroupEl.hidden = true;
     setupTokenInputEl.required = false;
   }
@@ -135,9 +143,12 @@
       return;
     }
 
-    if (loginEl._isSetup && password.length < 12) {
-      Toast.error('管理员密码至少需要 12 位');
-      return;
+    if (loginEl._isSetup) {
+      const passwordError = adminPasswordValidationError(password);
+      if (passwordError) {
+        Toast.error(passwordError);
+        return;
+      }
     }
 
     if (loginEl._isSetup && authStatus.setup_token_required && !setupToken) {

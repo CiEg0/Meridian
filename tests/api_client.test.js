@@ -108,3 +108,21 @@ test('mobile credential inputs disable keyboard text transformations', () => {
     assert.match(input[0], /\bspellcheck="false"/);
   }
 });
+
+test('setup password validation matches the server UTF-8 byte contract', () => {
+  const sandbox = loadAPIClient();
+  const invalid = '管理员密码必须为 12-72 字节';
+  const validate = password => vm.runInContext(
+    `adminPasswordValidationError(${JSON.stringify(password)})`,
+    sandbox,
+  );
+
+  assert.equal(validate('12345678901'), invalid);
+  assert.equal(validate('123456789012'), '');
+  assert.equal(validate('密码'), invalid);
+  assert.equal(validate('密码密码'), '');
+  assert.equal(validate('🙂🙂'), invalid);
+  assert.equal(validate('🙂🙂🙂'), '');
+  assert.equal(validate('x'.repeat(72)), '');
+  assert.equal(validate('x'.repeat(73)), invalid);
+});

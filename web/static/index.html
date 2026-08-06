@@ -23,8 +23,9 @@
         <input type="text" class="form-input" id="inp-username" placeholder="admin" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required>
       </div>
       <div class="form-group">
-        <label>密码</label>
+        <label for="inp-password">密码</label>
         <input type="password" class="form-input" id="inp-password" placeholder="••••••••" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+        <div class="form-help" id="admin-password-help" hidden>首次创建管理员时，密码必须为 12-72 字节。</div>
       </div>
       <div class="form-group" id="setup-token-group" hidden>
         <label for="inp-setup-token">初始化令牌</label>
@@ -96,10 +97,9 @@
     </div>
   </div>
 
-  <!-- Toast -->
-  <div id="toast-container"></div>
-
 </div>
+<!-- Toast -->
+<div id="toast-container" role="status" aria-live="polite" aria-atomic="false"></div>
 
 <script src="/js/api.js?v=1.9.0"></script>
 <script src="/js/toast.js?v=1.9.0"></script>

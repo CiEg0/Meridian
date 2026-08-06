@@ -98,6 +98,25 @@ const API = {
   }
 };
 
+// The server validates administrator passwords by UTF-8 byte length. Keep the
+// setup form on the same contract without allocating an encoded copy.
+function utf8ByteLength(value) {
+  let length = 0;
+  for (const char of String(value)) {
+    const codePoint = char.codePointAt(0);
+    if (codePoint <= 0x7f) length += 1;
+    else if (codePoint <= 0x7ff) length += 2;
+    else if (codePoint <= 0xffff) length += 3;
+    else length += 4;
+  }
+  return length;
+}
+
+function adminPasswordValidationError(password) {
+  const length = utf8ByteLength(password);
+  return length < 12 || length > 72 ? '管理员密码必须为 12-72 字节' : '';
+}
+
 // Shared HTML escaper. It lives in the first-loaded script that every page
 // already depends on, so no page can render markup before escaping exists.
 // Keep it a function declaration: pages reach it as a global.
